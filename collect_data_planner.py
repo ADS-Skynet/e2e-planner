@@ -6,9 +6,9 @@ Ghost-mode style data collection for the structured planner.
 Camera + YOLO + LKAS run as usual, but instead of saving raw images
 we log a single CSV row of normalised feature vectors per frame.
 
-  Camera → YOLO → object features  ─┐
-  Camera → LKAS → lane features    ─┤→ one CSV row  →  planner_data.csv
-  web-viewer  → human steering/throttle ─┘
+  Camera → YOLO     → object features  ─┐
+  Camera → LaneSeg  → lane grid (32)   ─┤→ one CSV row  →  planner_data.csv
+  web-viewer → human steering/throttle ─┘
 
 No .jpg / .npy files are created. The dataset is a plain CSV.
 
@@ -27,8 +27,7 @@ Controls (web viewer browser)
   ↓        throttle = 0        (full stop)
   Ctrl+C   quit and save
 
-Run alongside
-  lkas --broadcast   (image + detection SHM)
+Run standalone — no LKAS required.
   DO NOT run vehicle.py — this script controls JetRacer directly.
 
 Data layout
@@ -41,7 +40,6 @@ import time
 import signal
 import csv
 import argparse
-import importlib.util
 import numpy as np
 from pathlib import Path
 
@@ -74,35 +72,23 @@ except ImportError:
     print("[WARN] JetRacer not available — simulation mode (no motor output)")
     JETRACER_AVAILABLE = False
 
-# ── LKAS ──────────────────────────────────────────────────────────────────────
-try:
-    from lkas import LKASClient as _LKASClient
-    LKAS_AVAILABLE = True
-except ImportError as e:
-    print(f"[ERROR] LKAS not available: {e}")
-    sys.exit(1)
+# ── Lane segmentation (direct BiSeNet — no LKAS required) ────────────────────
+from lane_seg import LaneSeg
 
 # ── Web viewer ────────────────────────────────────────────────────────────────
 from planner_viewer import PlannerViewer
 
 # ── YOLO config ───────────────────────────────────────────────────────────────
-_config_path = script_dir.parent.parent / "config.py"
-_spec = importlib.util.spec_from_file_location("yolo_config", _config_path)
-_cfg  = importlib.util.module_from_spec(_spec)
-_cfg.__file__ = str(_config_path)
-_spec.loader.exec_module(_cfg)
-
-MODEL_PATH           = _cfg.MODEL_PATH
-CONFIDENCE_THRESHOLD = _cfg.CONFIDENCE_THRESHOLD
-IOU_THRESHOLD        = _cfg.IOU_THRESHOLD
-CLASS_NAMES          = _cfg.CLASS_NAMES
-N_YOLO_CLASSES       = len(CLASS_NAMES)
-YOLO_DEVICE          = 0 if torch.cuda.is_available() else 'cpu'
+from yolo_config import MODEL_PATH, CONFIDENCE_THRESHOLD, IOU_THRESHOLD, CLASS_NAMES
+N_YOLO_CLASSES = len(CLASS_NAMES)
+# YOLO must run on CPU — BiSeNet (LaneSeg) takes the GPU to avoid OOM on Jetson
+YOLO_DEVICE = 'cpu'
 
 # ── Planner model shared definitions ─────────────────────────────────────────
 from planner_model import (
     build_object_features,
-    build_lane_features,
+    build_lane_grid,
+    lane_boundaries_from_mask,
     csv_columns,
     N_MAX_OBJECTS,
     SCENARIO_LANE_FOLLOW, SCENARIO_OBSTACLE_AVOID, SCENARIO_PARKING, SCENARIO_STOP,
@@ -118,41 +104,9 @@ STEER_VALUE     = 0.9    # fixed steering magnitude for key presses
 SAVE_FPS        = 10     # max rows written per second
 YOLO_SKIP       = 3      # run YOLO every N frames (GPU memory constraint)
 
-FIXED_LEFT_LANE_X  = 255
-FIXED_RIGHT_LANE_X = 485
 
 DATA_DIR      = script_dir / "data"
 PLANNER_CSV   = DATA_DIR / "planner_data.csv"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LKAS helpers  (same as collect_data.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _find_y_at_distance(depth_array: np.ndarray, depth_scale: float,
-                        target_m: float = 0.7) -> int:
-    fallback = int(depth_array.shape[0] * 2 / 3)
-    if depth_scale <= 0:
-        return fallback
-    cx   = depth_array.shape[1] // 2
-    col  = depth_array[:, cx].astype(np.float32) * depth_scale
-    valid = col > 0
-    if not valid.any():
-        return fallback
-    diffs = np.abs(col - target_m)
-    diffs[~valid] = np.inf
-    return int(np.argmin(diffs))
-
-
-def _interpolate_lane_x(lane, y: float) -> float:
-    if hasattr(lane, 'x1'):
-        x1, y1, x2, y2 = lane.x1, lane.y1, lane.x2, lane.y2
-    else:
-        x1, y1, x2, y2 = lane
-    if y2 == y1:
-        return float(x1)
-    t = (y - y1) / (y2 - y1)
-    return x1 + t * (x2 - x1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,13 +136,13 @@ _visualizer = LKASVisualizer(image_width=FRAME_W, image_height=FRAME_H)
 
 
 def _annotate(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
-              left_x, right_x, saved_count, det=None):
+              left_x, right_x, saved_count, mask=None):
     out = frame.copy()
 
-    # ── Lane overlay via shared LKASVisualizer ────────────────────────────────
-    if det is not None and det.has_segmentation:
-        out = _visualizer.draw_segmentation(out, det.segmentation_mask)
-    if not (det is not None and det.has_segmentation):
+    # ── Lane overlay ──────────────────────────────────────────────────────────
+    if mask is not None:
+        out = _visualizer.draw_segmentation(out, mask)
+    else:
         # fallback: dim vertical lines at fixed positions
         h = out.shape[0]
         cv2.line(out, (int(left_x),  0), (int(left_x),  h), (80, 80, 160), 1)
@@ -266,15 +220,12 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
     print("  Controls: ← steer left  → steer right  ↓ stop  Ctrl+C quit")
     print("=" * 62)
 
-    # ── YOLO ─────────────────────────────────────────────────────────────────
+    # ── YOLO (CPU — GPU reserved for LaneSeg/BiSeNet) ────────────────────────
     if not Path(MODEL_PATH).exists():
         print(f"[ERROR] YOLO model not found: {MODEL_PATH}")
         sys.exit(1)
-    print(f"\n[YOLO] Loading: {MODEL_PATH}")
+    print(f"\n[YOLO] Loading: {MODEL_PATH}  (device=cpu)")
     yolo = _YOLO(MODEL_PATH)
-    if torch.cuda.is_available():
-        free_mb, total_mb = [x / 1024**2 for x in torch.cuda.mem_get_info(0)]
-        print(f"[YOLO] GPU {YOLO_DEVICE}  ({free_mb:.0f}/{total_mb:.0f} MB)")
 
     # ── Web viewer ────────────────────────────────────────────────────────────
     web_viewer = None
@@ -283,23 +234,14 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
         web_viewer.start()
         print(f"[WEB] Viewer: http://0.0.0.0:{web_port}")
 
+    # ── LaneSeg (direct BiSeNet — GPU) ────────────────────────────────────────
+    print("\n[LaneSeg] Loading BiSeNet...")
+    lane_seg = LaneSeg(device="auto")
+
     # ── Camera ───────────────────────────────────────────────────────────────
     print("\n[CAM] Opening RealSense camera...")
     camera = Camera(width=FRAME_W, height=FRAME_H, enable_depth=True)
     depth_scale = camera.depth_scale if camera.depth_scale > 0 else 0.001
-
-    # ── LKAS client (connects to LKAS-owned SHMs — same pattern as vehicle.py) ──
-    lkas_client = None
-    try:
-        print("[LKAS] Connecting...")
-        lkas_client = _LKASClient(
-            image_shm_name="image",
-            detection_shm_name="detection",
-            control_shm_name="control",
-        )
-        print("[LKAS] Connected — send_image() will write frames to image SHM")
-    except Exception as e:
-        print(f"[WARN] LKAS unavailable ({e}) — fixed lane fallback, no frame broadcast")
 
     # ── JetRacer ─────────────────────────────────────────────────────────────
     car = None
@@ -361,11 +303,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
             depth_array = depth_raw if depth_raw is not None else \
                           np.zeros((FRAME_H, FRAME_W), dtype=np.uint16)
 
-            # Send frame to LKAS via shared memory (same as vehicle.py)
-            if lkas_client is not None:
-                lkas_client.send_image(color_bgr, time.time(), frame_id)
-
-            # ── YOLO (every YOLO_SKIP frames) ─────────────────────────────────
+            # ── YOLO (every YOLO_SKIP frames, on CPU) ─────────────────────────
             yolo_frame_count += 1
             if yolo_frame_count % YOLO_SKIP == 0:
                 try:
@@ -374,7 +312,6 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                         conf=CONFIDENCE_THRESHOLD,
                         iou=IOU_THRESHOLD,
                         device=YOLO_DEVICE,
-                        half=torch.cuda.is_available(),  # FP16 halves VRAM usage
                         verbose=False,
                     )
                     boxes_raw, dists_raw, cids_raw, confs_raw = [], [], [], []
@@ -406,24 +343,10 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
             class_ids = cached_class_ids
             confs     = cached_confs
 
-            # ── Lane detection ───────────────────────────────────────────────
-            left_lane_x   = float(FIXED_LEFT_LANE_X)
-            right_lane_x  = float(FIXED_RIGHT_LANE_X)
-            lane_detected = False
-            det           = None
-            if lkas_client is not None:
-                try:
-                    det = lkas_client.get_detection(timeout=0.01)
-                    if det is not None and det.left_lane and det.right_lane:
-                        y_ref = _find_y_at_distance(depth_array, depth_scale)
-                        lx    = _interpolate_lane_x(det.left_lane, y_ref)
-                        rx    = _interpolate_lane_x(det.right_lane, y_ref)
-                        if 0 < lx < rx <= FRAME_W:
-                            left_lane_x   = lx
-                            right_lane_x  = rx
-                            lane_detected = True
-                except Exception:
-                    pass
+            # ── Lane segmentation (BiSeNet, every frame) ─────────────────────
+            mask = lane_seg.infer(color_bgr)
+            left_lane_x, right_lane_x = lane_boundaries_from_mask(mask)
+            lane_detected = bool(mask.any())
 
             # ── Human steering / throttle ─────────────────────────────────────
             if left_held and not right_held:
@@ -447,10 +370,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                 left_lane_x=left_lane_x, right_lane_x=right_lane_x,
                 frame_w=FRAME_W, frame_h=FRAME_H, n_classes=N_YOLO_CLASSES,
             )
-            lane_feats = build_lane_features(
-                left_lane_x=left_lane_x, right_lane_x=right_lane_x,
-                lane_detected=lane_detected, frame_w=FRAME_W,
-            )
+            lane_feats = build_lane_grid(mask)
             ego_feats = [prev_steering, prev_throttle / MAX_THROTTLE]
 
             # ── Save row (rate-limited, only when recording is toggled ON) ─────
@@ -500,7 +420,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                     color_bgr, boxes, distances, class_ids,
                     scenario, input_steering, input_throttle, fps,
                     left_lane_x, right_lane_x, saved_count,
-                    det=det if lkas_client is not None else None,
+                    mask=mask,
                 )
                 web_viewer.broadcast_frame(annotated)
                 web_viewer.broadcast_status({
@@ -530,9 +450,6 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
         except Exception: pass
         if web_viewer is not None:
             try: web_viewer.stop()
-            except Exception: pass
-        if lkas_client is not None:
-            try: lkas_client.close()
             except Exception: pass
 
         print(f"\n[COLLECT] Done — {saved_count} rows saved")

@@ -41,6 +41,7 @@ from planner_model import (
     csv_columns,
     row_to_tensors,
     N_MAX_OBJECTS, OBJ_FEATURES, LANE_FEATURES, EGO_FEATURES,
+    GRID_ROWS, GRID_COLS,
     N_SCENARIOS,
 )
 
@@ -96,10 +97,9 @@ class PlannerDataset(Dataset):
                               "lat_offset", "width_norm", "height_norm", "lane_overlap")]
         objects = torch.tensor(obj_vals, dtype=torch.float32)
 
-        # Lane features: (LANE_FEATURES,)
-        lane_vals = [float(row[k]) for k in (
-            "lane_detected", "lane_center_offset",
-            "lane_width_norm", "lane_left_x_norm", "lane_right_x_norm")]
+        # Lane features: (LANE_FEATURES,) — 4×8 spatial grid
+        lane_vals = [float(row[f"lane_r{r}c{c}"])
+                     for r in range(GRID_ROWS) for c in range(GRID_COLS)]
         lane = torch.tensor(lane_vals, dtype=torch.float32)
 
         # Ego features: (EGO_FEATURES,)

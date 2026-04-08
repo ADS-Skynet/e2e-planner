@@ -14,16 +14,14 @@ and outputs [steering, throttle] to the JetRacer and control SHM.
 
 Pipeline per frame
 ------------------
-  image SHM  →  YOLO          → object features  ─┐
-  image SHM  →  LKAS client   → lane features    ─┤ → PlannerModel → [steer, thr]
-  ego state  (from last cycle)                    ─┘
-                                                        ↓
-                                              control SHM + JetRacer
+  Camera  →  YOLO    → object features  ─┐
+  Camera  →  LaneSeg → lane grid (32)   ─┤ → PlannerModel → [steer, thr]
+  ego state  (from last cycle)          ─┘
+                                               ↓
+                                       control SHM (optional) + JetRacer
 
-Run alongside
--------------
-  lkas --broadcast    (creates image + detection SHM)
-  vehicle.py          (reads control SHM)  ← OR use --motor for direct drive
+Run standalone — no LKAS required.
+  vehicle.py    (reads control SHM)  ← optional; OR use --motor for direct drive
 
 Usage
 -----
@@ -34,7 +32,7 @@ Usage
 import sys
 import time
 import argparse
-import importlib.util
+import threading
 import numpy as np
 from pathlib import Path
 
@@ -43,6 +41,7 @@ import torch
 # ── Path setup ────────────────────────────────────────────────────────────────
 script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(script_dir.parent.parent / "vehicle" / "src"))
+sys.path.insert(0, str(script_dir.parent.parent.parent / "common" / "src"))
 
 # ── PyTorch legacy weights fix ────────────────────────────────────────────────
 _orig_torch_load = torch.load
@@ -55,6 +54,10 @@ torch.load = _torch_load_legacy
 
 from ultralytics import YOLO as _YOLO
 
+# ── Camera ────────────────────────────────────────────────────────────────────
+from camera import Camera
+from visualization.visualizer import LKASVisualizer
+
 # ── JetRacer ──────────────────────────────────────────────────────────────────
 try:
     from jetracer.nvidia_racecar import NvidiaRacecar
@@ -63,40 +66,31 @@ except ImportError:
     print("[WARN] JetRacer not available — simulation mode")
     JETRACER_AVAILABLE = False
 
-# ── LKAS ──────────────────────────────────────────────────────────────────────
+# ── Lane segmentation (direct BiSeNet — no LKAS required) ────────────────────
+from lane_seg import LaneSeg
+
+# ── Control SHM (optional — only needed when vehicle.py reads planner output) ─
 try:
-    from lkas.integration.shared_memory import (
-        SharedMemoryImageChannel,
-        SharedMemoryControlChannel,
-    )
-    from lkas.integration.shared_memory.messages import ObstacleMessage, ObstacleAction
-    from lkas import LKASClient
-    LKAS_AVAILABLE = True
-except ImportError as e:
-    print(f"[ERROR] LKAS not available: {e}")
-    sys.exit(1)
+    from lkas.integration.shared_memory import SharedMemoryControlChannel
+    from lkas.integration.shared_memory.messages import ControlMessage
+    LKAS_SHM_AVAILABLE = True
+except ImportError:
+    LKAS_SHM_AVAILABLE = False
+    print("[WARN] LKAS SHM not importable — control SHM disabled")
 
 # ── Web viewer ────────────────────────────────────────────────────────────────
 from planner_viewer import PlannerViewer
 
 # ── YOLO config ───────────────────────────────────────────────────────────────
-_cfg_path = script_dir.parent.parent / "config.py"
-_spec = importlib.util.spec_from_file_location("yolo_config", _cfg_path)
-_cfg  = importlib.util.module_from_spec(_spec)
-_cfg.__file__ = str(_cfg_path)
-_spec.loader.exec_module(_cfg)
-
-MODEL_PATH           = _cfg.MODEL_PATH
-CONFIDENCE_THRESHOLD = _cfg.CONFIDENCE_THRESHOLD
-IOU_THRESHOLD        = _cfg.IOU_THRESHOLD
-CLASS_NAMES          = _cfg.CLASS_NAMES
-N_YOLO_CLASSES       = len(CLASS_NAMES)
+from yolo_config import MODEL_PATH, CONFIDENCE_THRESHOLD, IOU_THRESHOLD, CLASS_NAMES
+N_YOLO_CLASSES = len(CLASS_NAMES)
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 from planner_model import (
     PlannerModel,
     build_object_features,
-    build_lane_features,
+    build_lane_grid,
+    lane_boundaries_from_mask,
     MAX_THROTTLE,
     FRAME_W, FRAME_H,
     SCENARIO_LANE_FOLLOW, SCENARIO_OBSTACLE_AVOID, SCENARIO_PARKING, SCENARIO_STOP,
@@ -107,10 +101,6 @@ PLANNER_MODEL_PATH = script_dir / "planner_model.pth"
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-YOLO_SKIP = 2              # run YOLO every N frames
-
-FIXED_LEFT_LANE_X  = 255
-FIXED_RIGHT_LANE_X = 485
 
 _SCENARIO_NAMES = {
     SCENARIO_LANE_FOLLOW:    "LANE_FOLLOW",
@@ -120,60 +110,29 @@ _SCENARIO_NAMES = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LKAS helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _find_y_at_distance(depth_array: np.ndarray, depth_scale: float,
-                        target_m: float = 0.7) -> int:
-    fallback = int(depth_array.shape[0] * 2 / 3)
-    if depth_scale <= 0:
-        return fallback
-    cx   = depth_array.shape[1] // 2
-    col  = depth_array[:, cx].astype(np.float32) * depth_scale
-    valid = col > 0
-    if not valid.any():
-        return fallback
-    diffs = np.abs(col - target_m)
-    diffs[~valid] = np.inf
-    return int(np.argmin(diffs))
-
-
-def _interpolate_lane_x(lane, y: float) -> float:
-    if hasattr(lane, 'x1'):
-        x1, y1, x2, y2 = lane.x1, lane.y1, lane.x2, lane.y2
-    else:
-        x1, y1, x2, y2 = lane
-    if y2 == y1:
-        return float(x1)
-    t = (y - y1) / (y2 - y1)
-    return x1 + t * (x2 - x1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Feature extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_features(
     boxes, distances, class_ids, confs,
-    left_lane_x, right_lane_x, lane_detected,
+    mask,
     prev_steering, prev_throttle,
     device,
 ):
     """
-    Build model-ready tensors from raw YOLO + lane data.
+    Build model-ready tensors from raw YOLO detections + BiSeNet lane mask.
     Returns (objects, lane, ego) tensors, all batched with B=1.
     """
+    left_lane_x, right_lane_x = lane_boundaries_from_mask(mask)
+
     obj_feats  = build_object_features(
         boxes=boxes, distances=distances,
         class_ids=class_ids, confs=confs,
         left_lane_x=left_lane_x, right_lane_x=right_lane_x,
         frame_w=FRAME_W, frame_h=FRAME_H, n_classes=N_YOLO_CLASSES,
     )
-    lane_feats = build_lane_features(
-        left_lane_x=left_lane_x, right_lane_x=right_lane_x,
-        lane_detected=lane_detected, frame_w=FRAME_W,
-    )
-    ego_feats = [prev_steering, prev_throttle / MAX_THROTTLE]
+    lane_feats = build_lane_grid(mask)
+    ego_feats  = [prev_steering, prev_throttle / MAX_THROTTLE]
 
     objects_t = torch.tensor(obj_feats,  dtype=torch.float32, device=device).unsqueeze(0)
     lane_t    = torch.tensor(lane_feats, dtype=torch.float32, device=device).unsqueeze(0)
@@ -186,6 +145,8 @@ def extract_features(
 # Annotation
 # ─────────────────────────────────────────────────────────────────────────────
 import cv2
+
+_visualizer = LKASVisualizer(image_width=FRAME_W, image_height=FRAME_H)
 
 _MODE_COLORS = {
     SCENARIO_LANE_FOLLOW:    (0, 255, 0),
@@ -201,11 +162,16 @@ _BOX_COLORS = [
 
 
 def _draw(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
-          left_x, right_x):
+          left_x, right_x, mask=None):
     out = frame.copy()
-    h   = out.shape[0]
-    cv2.line(out, (int(left_x), 0), (int(left_x), h), (255, 200, 0), 1)
-    cv2.line(out, (int(right_x), 0), (int(right_x), h), (255, 200, 0), 1)
+
+    # ── Lane segmentation overlay ─────────────────────────────────────────────
+    if mask is not None:
+        out = _visualizer.draw_segmentation(out, mask)
+    else:
+        h = out.shape[0]
+        cv2.line(out, (int(left_x), 0), (int(left_x), h), (80, 80, 160), 1)
+        cv2.line(out, (int(right_x), 0), (int(right_x), h), (80, 80, 160), 1)
 
     for box, dist, cid in zip(boxes, distances, class_ids):
         x1, y1, x2, y2 = map(int, box)
@@ -228,6 +194,46 @@ def _draw(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# YOLO background worker
+# Runs YOLO on CPU in a separate thread so the main loop is never blocked.
+# The main loop always reads the latest cached result.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_yolo_lock    = threading.Lock()
+_yolo_cache   = {'boxes': [], 'distances': [], 'class_ids': [], 'confs': []}
+_yolo_running = False   # True while a YOLO inference is in progress
+
+
+def _yolo_worker(yolo, frame, depth_array, depth_scale, frame_w, frame_h):
+    global _yolo_running, _yolo_cache
+    try:
+        results = yolo(frame, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD,
+                       device='cpu', verbose=False)
+        boxes_r, dists_r, cids_r, confs_r = [], [], [], []
+        if len(results[0].boxes) > 0:
+            xyxy  = results[0].boxes.xyxy.cpu().numpy()
+            cids  = results[0].boxes.cls.cpu().numpy().astype(int)
+            confs = results[0].boxes.conf.cpu().numpy()
+            for box, cid, conf in zip(xyxy, cids, confs):
+                cx = int(max(0, min((box[0] + box[2]) / 2, frame_w - 1)))
+                cy = int(max(0, min((box[1] + box[3]) / 2, frame_h - 1)))
+                raw  = int(depth_array[cy, cx])
+                dist = raw * depth_scale if raw > 0 else -1.0
+                boxes_r.append(box)
+                dists_r.append(dist)
+                cids_r.append(int(cid))
+                confs_r.append(float(conf))
+        with _yolo_lock:
+            _yolo_cache = {'boxes': boxes_r, 'distances': dists_r,
+                           'class_ids': cids_r, 'confs': confs_r}
+        del results
+    except Exception as e:
+        print(f"\n[YOLO] Error: {e}")
+    finally:
+        _yolo_running = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -236,14 +242,20 @@ def main(
     enable_motor: bool = False,
     scenario:     int  = SCENARIO_LANE_FOLLOW,
     model_path:   Path = PLANNER_MODEL_PATH,
+    verbose:      bool = False,
 ):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Both YOLO and planner run on CPU.
+    # LKAS BiSeNet (DL method, device="auto") claims the GPU; putting YOLO
+    # on GPU too causes OOM on Jetson's 7.4 GB unified memory pool.
+    yolo_device    = 'cpu'  # kept for reference; actual device set in _yolo_worker
+    planner_device = torch.device('cpu')
     sc_name = _SCENARIO_NAMES.get(scenario, str(scenario))
 
     print("=" * 62)
     print("  Planner Inference  (structured features → actuation)")
     print("=" * 62)
-    print(f"  Device    : {device}")
+    print(f"  YOLO device   : cpu  (GPU reserved for LaneSeg/BiSeNet)")
+    print(f"  Planner device: cpu")
     print(f"  Scenario  : {sc_name} ({scenario})")
     print(f"  Model     : {model_path}")
     print(f"  Motor     : {'ACTIVE' if enable_motor else 'SIMULATION'}")
@@ -255,8 +267,8 @@ def main(
         print(f"[ERROR] Planner model not found: {model_path}")
         print("        Run train_planner.py first.")
         sys.exit(1)
-    planner = PlannerModel().to(device)
-    state   = torch.load(str(model_path), map_location=device)
+    planner = PlannerModel().to(planner_device)
+    state   = torch.load(str(model_path), map_location=planner_device)
     planner.load_state_dict(state)
     planner.eval()
     n_params = sum(p.numel() for p in planner.parameters())
@@ -267,25 +279,28 @@ def main(
         print(f"[ERROR] YOLO model not found: {MODEL_PATH}")
         sys.exit(1)
     print(f"[YOLO] Loading: {MODEL_PATH}")
-    yolo        = _YOLO(MODEL_PATH)
-    yolo_device = 0 if device.type == 'cuda' else 'cpu'
+    yolo = _YOLO(MODEL_PATH)
 
-    # ── Shared memory ─────────────────────────────────────────────────────────
-    print("[SHM] Connecting to image SHM...")
-    image_channel   = SharedMemoryImageChannel(name="image",   create=False,
-                                               retry_count=60, retry_delay=1.0)
-    control_channel = SharedMemoryControlChannel(name="control", create=False,
-                                                 retry_count=30, retry_delay=1.0)
+    # ── LaneSeg (direct BiSeNet — GPU) ────────────────────────────────────────
+    print("[LaneSeg] Loading BiSeNet...")
+    lane_seg = LaneSeg(device="auto")
 
-    # ── LKAS client ──────────────────────────────────────────────────────────
-    lkas_client = None
-    try:
-        lkas_client = LKASClient(image_shm_name="image",
-                                 detection_shm_name="detection",
-                                 control_shm_name="control")
-        print("[LKAS] Lane detection client connected")
-    except Exception as e:
-        print(f"[WARN] LKAS unavailable ({e}) — fixed lane fallback active")
+    # ── Camera ────────────────────────────────────────────────────────────────
+    print("[CAM] Opening RealSense camera...")
+    camera      = Camera(width=FRAME_W, height=FRAME_H, enable_depth=True)
+    depth_scale = camera.depth_scale if camera.depth_scale > 0 else 0.001
+    frame_w, frame_h = FRAME_W, FRAME_H
+    print(f"[CAM] {frame_w}×{frame_h}  depth_scale={depth_scale}")
+
+    # ── Control SHM (optional) ────────────────────────────────────────────────
+    control_channel = None
+    if LKAS_SHM_AVAILABLE:
+        try:
+            control_channel = SharedMemoryControlChannel(
+                name="control", create=False, retry_count=3, retry_delay=0.5)
+            print("[SHM] Control channel connected")
+        except Exception as e:
+            print(f"[WARN] Control SHM unavailable ({e}) — motor-only mode")
 
     # ── JetRacer ─────────────────────────────────────────────────────────────
     car = None
@@ -308,106 +323,57 @@ def main(
     # ── State ─────────────────────────────────────────────────────────────────
     prev_steering    = 0.0
     prev_throttle    = 0.0
-    yolo_frame_count = 0
-    cached_boxes:     list = []
-    cached_distances: list = []
-    cached_class_ids: list = []
-    cached_confs:     list = []
 
     fps       = 0.0
     fps_count = 0
     fps_start = time.time()
 
-    scenario_t = torch.tensor([scenario], dtype=torch.long, device=device)
+    scenario_t = torch.tensor([scenario], dtype=torch.long, device=planner_device)
 
-    # First frame for dimensions + depth_scale
-    first_msg = image_channel.read_blocking(timeout=10.0)
-    if first_msg is None:
-        print("[ERROR] No frame from image SHM within 10 s")
-        sys.exit(1)
-    frame_h, frame_w = first_msg.image.shape[:2]
-    depth_scale = first_msg.depth_scale if first_msg.depth_scale > 0 else 0.001
-    print(f"[SHM] Frame: {frame_w}×{frame_h}  depth_scale={depth_scale}")
+    frame_id = 1
     print(f"\n[RUN] Running — Ctrl+C to stop\n")
 
     try:
         while True:
-            msg = image_channel.read()
-            if msg is None:
-                time.sleep(0.001)
+            color_bgr, depth_raw = camera.read_frames()
+            if color_bgr is None:
                 continue
 
-            color_bgr   = msg.image
-            depth_array = msg.depth_image if msg.depth_image is not None else \
+            depth_array = depth_raw if depth_raw is not None else \
                           np.zeros((frame_h, frame_w), dtype=np.uint16)
-            if msg.depth_scale > 0:
-                depth_scale = msg.depth_scale
+            frame_id += 1
 
-            # ── YOLO (every N frames) ─────────────────────────────────────────
-            yolo_frame_count += 1
-            if yolo_frame_count % YOLO_SKIP == 0:
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
-                try:
-                    results = yolo(color_bgr, conf=CONFIDENCE_THRESHOLD,
-                                   iou=IOU_THRESHOLD, device=yolo_device, verbose=False)
-                    boxes_r, dists_r, cids_r, confs_r = [], [], [], []
-                    if len(results[0].boxes) > 0:
-                        xyxy  = results[0].boxes.xyxy.cpu().numpy()
-                        cids  = results[0].boxes.cls.cpu().numpy().astype(int)
-                        confs = results[0].boxes.conf.cpu().numpy()
-                        for box, cid, conf in zip(xyxy, cids, confs):
-                            cx = int(max(0, min((box[0] + box[2]) / 2, frame_w - 1)))
-                            cy = int(max(0, min((box[1] + box[3]) / 2, frame_h - 1)))
-                            raw  = int(depth_array[cy, cx])
-                            dist = raw * depth_scale if raw > 0 else -1.0
-                            boxes_r.append(box)
-                            dists_r.append(dist)
-                            cids_r.append(int(cid))
-                            confs_r.append(float(conf))
-                    cached_boxes     = boxes_r
-                    cached_distances = dists_r
-                    cached_class_ids = cids_r
-                    cached_confs     = confs_r
-                except Exception as e:
-                    print(f"[YOLO] Error: {e}")
+            # ── Lane segmentation (BiSeNet, GPU, every frame) ──────────────────
+            mask          = lane_seg.infer(color_bgr)
+            lane_detected = bool(mask.any())
+            left_x, right_x = lane_boundaries_from_mask(mask)
 
-            boxes     = cached_boxes
-            distances = cached_distances
-            class_ids = cached_class_ids
-            confs     = cached_confs
+            # ── YOLO (background thread — never blocks the main loop) ─────────
+            global _yolo_running
+            if not _yolo_running:
+                _yolo_running = True
+                threading.Thread(
+                    target=_yolo_worker,
+                    args=(yolo, color_bgr.copy(), depth_array.copy(),
+                          depth_scale, frame_w, frame_h),
+                    daemon=True,
+                ).start()
 
-            # ── Lane boundaries from LKAS ──────────────────────────────────────
-            left_x        = float(FIXED_LEFT_LANE_X)
-            right_x       = float(FIXED_RIGHT_LANE_X)
-            lane_detected = False
-            lkas_steering = 0.0
-            if lkas_client is not None:
-                try:
-                    det = lkas_client.get_detection(timeout=0.01)
-                    if det is not None and det.left_lane and det.right_lane:
-                        y_ref = _find_y_at_distance(depth_array, depth_scale)
-                        lx    = _interpolate_lane_x(det.left_lane, y_ref)
-                        rx    = _interpolate_lane_x(det.right_lane, y_ref)
-                        if 0 < lx < rx <= frame_w:
-                            left_x        = lx
-                            right_x       = rx
-                            lane_detected = True
-                    ctrl = lkas_client.get_control(timeout=0.01)
-                    if ctrl is not None:
-                        lkas_steering = ctrl.steering
-                except Exception:
-                    pass
+            with _yolo_lock:
+                r         = _yolo_cache
+            boxes     = r['boxes']
+            distances = r['distances']
+            class_ids = r['class_ids']
+            confs     = r['confs']
 
             # ── Planner forward pass ───────────────────────────────────────────
             with torch.no_grad():
                 objects_t, lane_t, ego_t = extract_features(
                     boxes=boxes, distances=distances,
                     class_ids=class_ids, confs=confs,
-                    left_lane_x=left_x, right_lane_x=right_x,
-                    lane_detected=lane_detected,
+                    mask=mask,
                     prev_steering=prev_steering, prev_throttle=prev_throttle,
-                    device=device,
+                    device=planner_device,
                 )
                 out = planner(objects_t, lane_t, ego_t, scenario_t)  # (1, 2)
 
@@ -419,29 +385,48 @@ def main(
             final_steering = float(np.clip(final_steering, -1.0,  1.0))
             final_throttle = float(np.clip(final_throttle,  0.0, MAX_THROTTLE))
 
-            # ── Apply to vehicle ───────────────────────────────────────────────
+            # ── Verbose debug ──────────────────────────────────────────────────
+            if verbose:
+                lane_f = lane_t[0].tolist()
+                ego_f  = ego_t[0].tolist()
+                # Print 4×8 grid as rows (far → near)
+                from planner_model import GRID_ROWS, GRID_COLS
+                print(f"\n[DBG lane ] detected={'YES' if lane_detected else 'NO '}  "
+                      f"left_x={left_x:.1f}  right_x={right_x:.1f}")
+                for r in range(GRID_ROWS):
+                    cells = "  ".join(f"{lane_f[r*GRID_COLS+c]:.2f}"
+                                      for c in range(GRID_COLS))
+                    depth = "far " if r == 0 else ("near" if r == GRID_ROWS-1 else f"r{r} ")
+                    print(f"  [{depth}]  {cells}")
+                print(f"[DBG ego  ] prev_steer={ego_f[0]:+.4f}  "
+                      f"prev_thr_norm={ego_f[1]:.4f}")
+                print(f"[DBG objs ] count={len(boxes)}", end="")
+                for i, (box, dist, cid) in enumerate(zip(boxes, distances, class_ids)):
+                    print(f"\n  [{i}] {CLASS_NAMES[cid] if cid < len(CLASS_NAMES) else cid}"
+                          f"  dist={dist:.2f}m  box={[int(v) for v in box]}", end="")
+                print(f"\n[DBG out  ] steer={final_steering:+.4f}  thr={final_throttle:.4f}")
+
+            # ── Apply to vehicle (suppressed when paused) ──────────────────────
+            is_paused = web_viewer.paused if web_viewer is not None else False
+            act_steering = 0.0 if is_paused else final_steering
+            act_throttle = 0.0 if is_paused else final_throttle
+
             if car is not None:
-                car.steering = -final_steering   # hardware inversion
-                car.throttle = -final_throttle   # negative = forward
+                car.steering = -act_steering   # hardware inversion
+                car.throttle = -act_throttle   # negative = forward
 
-            # ── Write to control SHM ───────────────────────────────────────────
+            # ── Write to control SHM (optional) ───────────────────────────────
             nearest = min((d for d in distances if d > 0), default=-1.0)
-            action  = (ObstacleAction.AVOID_LEFT  if final_steering < -0.1 else
-                       ObstacleAction.AVOID_RIGHT if final_steering >  0.1 else
-                       ObstacleAction.NORMAL)
-            obstacle_msg = ObstacleMessage(
-                active   = len(boxes) > 0,
-                action   = action,
-                distance = nearest,
-                steering = final_steering,
-                throttle = final_throttle,
-                brake    = 1.0 if scenario == SCENARIO_STOP else 0.0,
-                timestamp= time.time(),
-                frame_id = msg.frame_id,
-            )
-            control_channel.write_obstacle(obstacle_msg)
+            if control_channel is not None:
+                control_msg = ControlMessage(
+                    steering = act_steering,
+                    throttle = act_throttle,
+                    brake    = 1.0 if (is_paused or scenario == SCENARIO_STOP) else 0.0,
+                )
+                control_channel.write(control_msg, frame_id=frame_id,
+                                      timestamp=time.time(), processing_time_ms=0.0)
 
-            # Update ego state
+            # Update ego state (always track model output, not suppressed values)
             prev_steering = final_steering
             prev_throttle = final_throttle
 
@@ -465,7 +450,7 @@ def main(
             if web_viewer is not None:
                 annotated = _draw(color_bgr, boxes, distances, class_ids,
                                   scenario, final_steering, final_throttle, fps,
-                                  left_x, right_x)
+                                  left_x, right_x, mask=mask)
                 web_viewer.broadcast_frame(annotated)
                 web_viewer.broadcast_status({
                     'fps':              fps,
@@ -473,9 +458,7 @@ def main(
                     'steering':         final_steering,
                     'throttle':         final_throttle,
                     'nearest_distance': nearest,
-                    'overtaking_state': sc_name,
                     'lane_detected':    lane_detected,
-                    'lkas_steering':    lkas_steering,
                     'left_lane_x':      left_x,
                     'right_lane_x':     right_x,
                 })
@@ -487,11 +470,10 @@ def main(
         if car is not None:
             car.throttle = 0.0
             car.steering = 0.0
+        try: camera.close()
+        except Exception: pass
         if web_viewer is not None:
             try: web_viewer.stop()
-            except Exception: pass
-        if lkas_client is not None:
-            try: lkas_client.close()
             except Exception: pass
         print("[RUN] Cleanup done")
 
@@ -511,9 +493,12 @@ if __name__ == "__main__":
                         help='0=LANE_FOLLOW 1=OBSTACLE_AVOID 2=PARKING 3=STOP')
     parser.add_argument('--model',    type=Path, default=PLANNER_MODEL_PATH,
                         help=f'Model .pth file (default: {PLANNER_MODEL_PATH})')
+    parser.add_argument('--verbose',  action='store_true',
+                        help='Print per-frame debug: object list, lane, model outputs')
     args = parser.parse_args()
 
     main(web_port     = args.web_port,
          enable_motor = args.motor,
          scenario     = args.scenario,
-         model_path   = args.model)
+         model_path   = args.model,
+         verbose      = args.verbose)

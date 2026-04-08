@@ -13,8 +13,8 @@ Feature layout
 Objects   : N_MAX_OBJECTS rows × OBJ_FEATURES cols  (sorted by distance, padded with zeros)
   [valid, class_norm, confidence, dist_norm, lat_offset, width_norm, height_norm, lane_overlap]
 
-Lane      : LANE_FEATURES cols
-  [lane_detected, center_offset, width_norm, left_x_norm, right_x_norm]
+Lane      : LANE_FEATURES cols  (4×8 spatial grid from BiSeNet mask)
+  [lane_r0c0 … lane_r3c7]  per-cell lane fraction [0.0–1.0], row-major
 
 Ego state : EGO_FEATURES cols
   [prev_steering, prev_throttle]
@@ -35,13 +35,19 @@ import torch.nn as nn
 # ─────────────────────────────────────────────────────────────────────────────
 N_MAX_OBJECTS = 5      # objects tracked per frame (padded to this length)
 OBJ_FEATURES  = 8     # features per object slot
-LANE_FEATURES = 5     # lane state features
+GRID_ROWS     = 4     # spatial grid rows (far → near)
+GRID_COLS     = 8     # spatial grid columns (left → right)
+LANE_FEATURES = GRID_ROWS * GRID_COLS   # 32 — spatial grid of lane fractions
 EGO_FEATURES  = 2     # ego state features (prev_steering, prev_throttle)
 N_SCENARIOS   = 4     # scenario vocabulary size
 SCENARIO_DIM  = 8     # embedding dimension for scenario token
 
 OBJECT_BLOCK_DIM = N_MAX_OBJECTS * OBJ_FEATURES   # 40
-TOTAL_FLAT_DIM   = OBJECT_BLOCK_DIM + LANE_FEATURES + EGO_FEATURES  # 47
+TOTAL_FLAT_DIM   = OBJECT_BLOCK_DIM + LANE_FEATURES + EGO_FEATURES  # 74
+
+# Fallback lane boundary x-coordinates when the mask contains no lane pixels
+FIXED_LEFT_LANE_X  = 255
+FIXED_RIGHT_LANE_X = 485
 
 # Scenario tokens
 SCENARIO_LANE_FOLLOW    = 0
@@ -123,38 +129,65 @@ def build_object_features(
     return out
 
 
-def build_lane_features(
-    left_lane_x:  float,
-    right_lane_x: float,
-    lane_detected: bool,
-    frame_w: int = FRAME_W,
-) -> list:
+def build_lane_grid(mask: "np.ndarray") -> list:
     """
-    Returns a flat list of LANE_FEATURES floats.
+    Convert a BiSeNet segmentation mask to a coarse spatial grid of lane fractions.
 
-    Layout:
-      [lane_detected, center_offset, width_norm, left_x_norm, right_x_norm]
+    Resizes the binary lane mask to (_GRID_H × _GRID_W) using INTER_AREA
+    (which averages pixels, giving per-pixel fractions), then returns the
+    mean lane fraction for each of the (GRID_ROWS × GRID_COLS) cells.
 
-    center_offset: (frame_centre − lane_centre) / lane_width
-      positive  → vehicle is left of lane centre (needs right steering)
-      negative  → vehicle is right of lane centre (needs left steering)
+    Row 0 = far (top of image), Row GRID_ROWS-1 = near (bottom).
+    Column 0 = left edge, Column GRID_COLS-1 = right edge.
+
+    Args:
+        mask: (H, W) uint8 — 0 = background, 1+ = lane  (from LaneSeg.infer)
+
+    Returns:
+        list of LANE_FEATURES (32) floats — lane fraction per cell [0.0–1.0],
+        in row-major order (r0c0, r0c1, …, r3c7).
     """
-    frame_cx    = frame_w / 2.0
-    lane_width  = max(right_lane_x - left_lane_x, 1.0)
-    lane_center = (left_lane_x + right_lane_x) / 2.0
+    import cv2
+    import numpy as _np
 
-    center_offset = (frame_cx - lane_center) / lane_width
-    width_norm    = lane_width / frame_w
-    left_x_norm   = left_lane_x  / frame_w
-    right_x_norm  = right_lane_x / frame_w
+    _GRID_H = GRID_ROWS * 16   # 64
+    _GRID_W = GRID_COLS * 14   # 112  (≈ 848×480 aspect at coarse scale)
 
-    return [
-        1.0 if lane_detected else 0.0,
-        float(center_offset),
-        float(width_norm),
-        float(left_x_norm),
-        float(right_x_norm),
-    ]
+    binary = (mask > 0).astype(_np.float32)
+    small  = cv2.resize(binary, (_GRID_W, _GRID_H), interpolation=cv2.INTER_AREA)
+
+    cell_h = _GRID_H // GRID_ROWS   # 16
+    cell_w = _GRID_W // GRID_COLS   # 14
+
+    features = []
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            cell = small[r * cell_h:(r + 1) * cell_h,
+                         c * cell_w:(c + 1) * cell_w]
+            features.append(float(cell.mean()))
+    return features
+
+
+def lane_boundaries_from_mask(
+    mask: "np.ndarray",
+    roi_fraction: float = 0.33,
+) -> tuple:
+    """
+    Derive approximate left/right lane boundary x-coordinates from a
+    segmentation mask.  Uses the bottom roi_fraction of the image
+    (near-field), finds leftmost and rightmost lane columns.
+
+    Returns:
+        (left_x, right_x) in pixels — or (FIXED_LEFT_LANE_X, FIXED_RIGHT_LANE_X)
+        if no lane pixels are found in the ROI.
+    """
+    import numpy as _np
+    h    = mask.shape[0]
+    roi  = mask[int(h * (1.0 - roi_fraction)):, :]
+    cols = _np.where(roi.any(axis=0))[0]
+    if len(cols) < 2:
+        return float(FIXED_LEFT_LANE_X), float(FIXED_RIGHT_LANE_X)
+    return float(cols[0]), float(cols[-1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,7 +202,7 @@ class PlannerModel(nn.Module):
 
     Inputs (all float32 except scenario which is long):
       objects  : (B, N_MAX_OBJECTS * OBJ_FEATURES)   40-dim
-      lane     : (B, LANE_FEATURES)                   5-dim
+      lane     : (B, LANE_FEATURES)                   32-dim  (4×8 spatial grid)
       ego      : (B, EGO_FEATURES)                    2-dim
       scenario : (B,)                                 long
     """
@@ -186,9 +219,11 @@ class PlannerModel(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Lane encoder
+        # Lane encoder — two layers to handle 32-cell spatial grid
         self.lane_enc = nn.Sequential(
-            nn.Linear(LANE_FEATURES, 32),
+            nn.Linear(LANE_FEATURES, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 32),
             nn.ReLU(inplace=True),
         )
 
@@ -224,7 +259,7 @@ class PlannerModel(nn.Module):
     def forward(
         self,
         objects:  torch.Tensor,   # (B, 40)
-        lane:     torch.Tensor,   # (B, 5)
+        lane:     torch.Tensor,   # (B, LANE_FEATURES) = (B, 32)
         ego:      torch.Tensor,   # (B, 2)
         scenario: torch.Tensor,   # (B,) long
     ) -> torch.Tensor:            # (B, 2)  [steering, throttle_norm]
@@ -261,13 +296,8 @@ def csv_columns() -> list[str]:
             f"obj{i}_height_norm",
             f"obj{i}_lane_overlap",
         ]
-    cols += [
-        "lane_detected",
-        "lane_center_offset",
-        "lane_width_norm",
-        "lane_left_x_norm",
-        "lane_right_x_norm",
-    ]
+    cols += [f"lane_r{r}c{c}"
+             for r in range(GRID_ROWS) for c in range(GRID_COLS)]
     cols += ["ego_steering", "ego_throttle"]
     cols += ["scenario", "target_steering", "target_throttle"]
     return cols
@@ -284,9 +314,8 @@ def row_to_tensors(row, device=None):
                  for i in range(N_MAX_OBJECTS)
                  for f in ("valid", "class_norm", "conf", "dist_norm",
                            "lat_offset", "width_norm", "height_norm", "lane_overlap")]
-    lane_vals = [float(row[k]) for k in (
-        "lane_detected", "lane_center_offset",
-        "lane_width_norm", "lane_left_x_norm", "lane_right_x_norm")]
+    lane_vals = [float(row[f"lane_r{r}c{c}"])
+                 for r in range(GRID_ROWS) for c in range(GRID_COLS)]
     ego_vals  = [float(row["ego_steering"]), float(row["ego_throttle"])]
     scenario  = int(row["scenario"])
 

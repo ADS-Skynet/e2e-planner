@@ -40,6 +40,7 @@ from pathlib import Path
 
 from planner_model import (
     N_MAX_OBJECTS, OBJ_FEATURES, LANE_FEATURES, EGO_FEATURES,
+    GRID_ROWS, GRID_COLS,
     csv_columns,
 )
 
@@ -64,11 +65,11 @@ OBJ_W_COLS         = [_obj_col(i, "width_norm")  for i in range(N_MAX_OBJECTS)]
 OBJ_H_COLS         = [_obj_col(i, "height_norm") for i in range(N_MAX_OBJECTS)]
 OBJ_OVERLAP_COLS   = [_obj_col(i, "lane_overlap")for i in range(N_MAX_OBJECTS)]
 
-LANE_DETECTED_COL    = _col("lane_detected")
-LANE_CENTER_COL      = _col("lane_center_offset")
-LANE_WIDTH_COL       = _col("lane_width_norm")
-LANE_LEFT_COL        = _col("lane_left_x_norm")
-LANE_RIGHT_COL       = _col("lane_right_x_norm")
+# Lane grid column indices — LANE_GRID_COLS[r][c] is the index of cell (r, c)
+LANE_GRID_COLS = [
+    [_col(f"lane_r{r}c{c}") for c in range(GRID_COLS)]
+    for r in range(GRID_ROWS)
+]
 
 TARGET_STEER_COL  = _col("target_steering")
 TARGET_THTL_COL   = _col("target_throttle")
@@ -99,20 +100,17 @@ def aug_mirror(row: np.ndarray, rng) -> np.ndarray:
     """
     Horizontal flip of the scene.
     - Negate all object lateral offsets
-    - Negate lane center offset
-    - Swap left/right lane x positions
+    - Reverse column order within each grid row (left ↔ right)
     - Negate steering target and ego steering
-    - Lane overlap stays the same (symmetric)
     """
     r = _clone(row)
     for c in OBJ_LAT_COLS:
         r[c] = -r[c]
-    r[LANE_CENTER_COL] = -r[LANE_CENTER_COL]
-    # Swap left/right x in normalised space  (left_x + right_x = 1 in many cases but not guaranteed)
-    old_left  = r[LANE_LEFT_COL]
-    old_right = r[LANE_RIGHT_COL]
-    r[LANE_LEFT_COL]  = 1.0 - old_right
-    r[LANE_RIGHT_COL] = 1.0 - old_left
+    # Flip lane grid columns left ↔ right within each row
+    for gr in range(GRID_ROWS):
+        vals = [r[LANE_GRID_COLS[gr][c]] for c in range(GRID_COLS)]
+        for c in range(GRID_COLS):
+            r[LANE_GRID_COLS[gr][c]] = vals[GRID_COLS - 1 - c]
     # Negate steering
     r[TARGET_STEER_COL] = -r[TARGET_STEER_COL]
     r[EGO_STEER_COL]    = -r[EGO_STEER_COL]
@@ -130,12 +128,22 @@ def aug_distance_noise(row: np.ndarray, rng, sigma: float = 0.03) -> np.ndarray:
 
 
 def aug_lateral_jitter(row: np.ndarray, rng, sigma: float = 0.04) -> np.ndarray:
-    """Add Gaussian noise to lateral offsets and lane center offset."""
+    """
+    Lateral jitter: shift object offsets and roll the lane grid by ±1 column.
+    A 1-column roll represents a ~1/8-width lateral shift of the vehicle.
+    """
     r = _clone(row)
     for i in range(N_MAX_OBJECTS):
         if r[OBJ_VALID_COLS[i]] > 0.5:
             r[OBJ_LAT_COLS[i]] += rng.normal(0, sigma)
-    r[LANE_CENTER_COL] += rng.normal(0, sigma)
+    # Roll lane grid by -1, 0, or +1 column (25/50/25 probability)
+    shift = rng.choice([-1, 0, 0, 1])
+    if shift != 0:
+        for gr in range(GRID_ROWS):
+            vals = [r[LANE_GRID_COLS[gr][c]] for c in range(GRID_COLS)]
+            for c in range(GRID_COLS):
+                src = c - shift
+                r[LANE_GRID_COLS[gr][c]] = vals[src] if 0 <= src < GRID_COLS else 0.0
     return r
 
 
@@ -256,8 +264,9 @@ def augment(input_csv: Path, output_csv: Path, seed: int = 42) -> None:
         aug_df[f"obj{i}_lane_overlap"]= aug_df[f"obj{i}_lane_overlap"].clip(0, 1)
         aug_df[f"obj{i}_width_norm"]  = aug_df[f"obj{i}_width_norm"].clip(0, 1)
         aug_df[f"obj{i}_height_norm"] = aug_df[f"obj{i}_height_norm"].clip(0, 1)
-    aug_df["lane_left_x_norm"]  = aug_df["lane_left_x_norm"].clip(0, 1)
-    aug_df["lane_right_x_norm"] = aug_df["lane_right_x_norm"].clip(0, 1)
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            aug_df[f"lane_r{r}c{c}"] = aug_df[f"lane_r{r}c{c}"].clip(0, 1)
     aug_df["target_steering"]   = aug_df["target_steering"].clip(-1, 1)
     aug_df["target_throttle"]   = aug_df["target_throttle"].clip(0, 1)
 

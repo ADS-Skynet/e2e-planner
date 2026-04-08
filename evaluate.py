@@ -38,6 +38,7 @@ from planner_model import (
     N_MAX_OBJECTS,
     MAX_THROTTLE,
     N_SCENARIOS,
+    GRID_ROWS, GRID_COLS,
 )
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
@@ -73,8 +74,8 @@ def _load_tensors(csv_path: Path, device):
                  for i in range(N_MAX_OBJECTS)
                  for f in ("valid", "class_norm", "conf", "dist_norm",
                            "lat_offset", "width_norm", "height_norm", "lane_overlap")]
-    lane_cols = ["lane_detected", "lane_center_offset",
-                 "lane_width_norm", "lane_left_x_norm", "lane_right_x_norm"]
+    lane_cols = [f"lane_r{r}c{c}"
+                 for r in range(GRID_ROWS) for c in range(GRID_COLS)]
     ego_cols  = ["ego_steering", "ego_throttle"]
 
     objects  = torch.tensor(df[obj_cols].values,  dtype=torch.float32, device=device)

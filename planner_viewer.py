@@ -81,6 +81,11 @@ _HTML = """<!DOCTYPE html>
                padding:3px 14px; border-radius:4px; letter-spacing:1px; }
   #rec-badge.on  { background:#c00; color:#fff; }
   #rec-badge.off { background:#333; color:#666; }
+  #pause-btn { font-size:0.9rem; font-weight:bold; margin:4px 0 2px;
+               padding:4px 20px; border-radius:4px; letter-spacing:1px;
+               border:none; cursor:pointer; }
+  #pause-btn.paused   { background:#f80; color:#000; }
+  #pause-btn.running  { background:#282; color:#fff; }
   .steer-bar { width:200px; height:14px; background:#222; border:1px solid #444;
                border-radius:3px; position:relative; margin:4px auto; }
   .steer-indicator { position:absolute; top:2px; width:6px; height:10px;
@@ -91,6 +96,7 @@ _HTML = """<!DOCTYPE html>
 <h1>Planner Viewer</h1>
 <canvas id="feed" width="848" height="480"></canvas>
 <div id="rec-badge" class="off">⏺ REC OFF</div>
+<button id="pause-btn" class="running" onclick="togglePause()">▶ RUNNING</button>
 <div id="status">
   <span class="label">Scenario</span>  <span class="val" id="s-scenario">—</span>
   <span class="label">Steering</span>  <span class="val" id="s-steering">0.000</span>
@@ -103,7 +109,7 @@ _HTML = """<!DOCTYPE html>
 <div class="steer-bar">
   <div class="steer-indicator" id="steer-indicator" style="left:50%"></div>
 </div>
-<div id="ctrl">← / → steer (hold) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record toggle</div>
+<div id="ctrl">← / → steer (hold) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause</div>
 
 <script>
 const canvas = document.getElementById('feed');
@@ -178,6 +184,7 @@ const THROTTLE_MAX  = 1.0;
 let steering  = 0.0;
 let throttle  = 0.0;  // default 0 — ↑ adds 0.1 per press, ↓ resets to 0
 let recording = false;
+let paused    = false;
 
 function sendControl() {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -191,6 +198,21 @@ function sendRecording() {
   }
 }
 
+function togglePause() {
+  paused = !paused;
+  const btn = document.getElementById('pause-btn');
+  if (paused) {
+    btn.textContent = '⏸ PAUSED';
+    btn.className   = 'paused';
+  } else {
+    btn.textContent = '▶ RUNNING';
+    btn.className   = 'running';
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type:'pause_toggle'}));
+  }
+}
+
 document.addEventListener('keydown', (e) => {
   let changed = false;
   if      (e.key === 'ArrowLeft')  { steering = -STEER_VAL; changed = true; }
@@ -201,6 +223,7 @@ document.addEventListener('keydown', (e) => {
   }
   else if (e.key === 'ArrowDown')  { throttle = 0.0; changed = true; }
   else if (e.key === ' ')          { sendRecording(); e.preventDefault(); return; }
+  else if (e.key === 'p' || e.key === 'P') { togglePause(); e.preventDefault(); return; }
   if (changed) { e.preventDefault(); sendControl(); }
 });
 
@@ -254,6 +277,7 @@ class PlannerViewer:
         self._steering  = 0.0   # raw from browser: -1/0/+1
         self._throttle  = 0.0   # 0–1; ↑ adds 0.1 per press, ↓ resets to 0
         self._recording = False  # toggled by Space
+        self._paused    = False  # toggled by P / pause button
 
         self._clients:  Set = set()
         self._loop:     Optional[asyncio.AbstractEventLoop] = None
@@ -282,6 +306,12 @@ class PlannerViewer:
         """True when the Space toggle is ON — data should be saved."""
         with self._lock:
             return self._recording
+
+    @property
+    def paused(self) -> bool:
+        """True when P / pause button is active — motor output should be suppressed."""
+        with self._lock:
+            return self._paused
 
     # ── Broadcast ─────────────────────────────────────────────────────────────
 
@@ -399,6 +429,11 @@ class PlannerViewer:
                             self._recording = not self._recording
                         state = 'ON' if self._recording else 'OFF'
                         print(f"[PlannerViewer] Recording {state}")
+                    elif msg.get('type') == 'pause_toggle':
+                        with self._lock:
+                            self._paused = not self._paused
+                        state = 'PAUSED' if self._paused else 'RUNNING'
+                        print(f"[PlannerViewer] {state}")
                 except (json.JSONDecodeError, ValueError):
                     pass
         except Exception:
