@@ -1,0 +1,22 @@
+# Desktop training requirements
+# Ubuntu 22.04 x86_64 | Python 3.10 | RTX 5080 (Blackwell sm_120) | CUDA 12.8 driver
+#
+# PyTorch: RTX 5080 requires >= 2.6 for Blackwell (sm_120) native CUDA support.
+#          CUDA driver 12.8 is backward-compatible with cu126 wheels.
+#
+# Install PyTorch separately first (index URL required):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#
+# Then install the rest:
+#   pip install -r requirements_desktop.txt
+
+# ── Core training stack ───────────────────────────────────────────────────────
+torch>=2.6.0           # Blackwell sm_120 support added in 2.6
+torchvision>=0.21.0    # matches torch 2.6
+
+# ── Data + training utilities ─────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0          # upgrade from 1.21.5 — required by pandas 2.x
+matplotlib>=3.7.0      # upgrade from 3.5.1
+Pillow>=10.0.0         # upgrade from 9.0.1 — required by newer torchvision
+scikit-learn>=1.3.0    # used by evaluate.py (metrics)
