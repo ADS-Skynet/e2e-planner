@@ -46,8 +46,8 @@ from pathlib import Path
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 script_dir = Path(__file__).resolve().parent
-sys.path.insert(0, str(script_dir.parent.parent / "vehicle" / "src"))
-sys.path.insert(0, str(script_dir.parent.parent.parent / "common" / "src"))
+sys.path.append(str(script_dir.parent / "vehicle" / "src"))
+sys.path.append(str(script_dir.parent / "common" / "src"))
 
 # ── PyTorch legacy weights fix ────────────────────────────────────────────────
 import torch

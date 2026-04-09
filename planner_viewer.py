@@ -244,10 +244,16 @@ document.addEventListener('keyup', (e) => {
 # ─────────────────────────────────────────────────────────────────────────────
 class _HTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/favicon.ico':
+            self.send_response(204)   # no content — stops browser second request
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            return
         body = _HTML.encode()
         self.send_response(200)
         self.send_header('Content-Type',   'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection',     'close')   # close after response — stops browser loading spinner
         self.end_headers()
         self.wfile.write(body)
 

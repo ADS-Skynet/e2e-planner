@@ -25,7 +25,7 @@ from pathlib import Path
 # BiSeNet is at  ads-skynet/lane-detection-dl/
 # ─────────────────────────────────────────────────────────────────────────────
 _V11_DIR        = Path(__file__).resolve().parent
-_BISENET_ROOT   = _V11_DIR.parent.parent.parent / "lane-detection-dl"
+_BISENET_ROOT   = _V11_DIR.parent / "lane-detection-dl"
 _MODEL_WEIGHTS  = _BISENET_ROOT / "inference" / "bisenet-0204.pth"
 _MODEL_CODE_DIR = str(_BISENET_ROOT)
 
