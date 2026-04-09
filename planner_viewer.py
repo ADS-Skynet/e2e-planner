@@ -76,7 +76,7 @@ _HTML = """<!DOCTYPE html>
             border:1px solid #333; border-radius:4px; min-width:320px; }
   .label { color:#888; }
   .val   { color:#ffe; text-align:right; }
-  #ctrl  { margin-top:6px; font-size:0.75rem; color:#555; }
+  #ctrl  { margin-top:6px; font-size:0.75rem; color:#666; }
   #rec-badge { font-size:0.9rem; font-weight:bold; margin:6px 0 2px;
                padding:3px 14px; border-radius:4px; letter-spacing:1px; }
   #rec-badge.on  { background:#c00; color:#fff; }
@@ -109,7 +109,7 @@ _HTML = """<!DOCTYPE html>
 <div class="steer-bar">
   <div class="steer-indicator" id="steer-indicator" style="left:50%"></div>
 </div>
-<div id="ctrl">← / → steer (hold) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause</div>
+<div id="ctrl">← / → steer (hold = ramp ±0.05/100ms) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause</div>
 
 <script>
 const canvas = document.getElementById('feed');
@@ -177,14 +177,18 @@ function connect() {
 connect();
 
 // ── Key controls ────────────────────────────────────────────────────────────
-const STEER_VAL     = 1.0;
-const THROTTLE_STEP = 0.1;
-const THROTTLE_MAX  = 1.0;
+const STEER_STEP     = 0.05;   // increment per ramp tick
+const STEER_INTERVAL = 100;    // ms between ramp ticks
+const STEER_MAX      = 1.0;
+const THROTTLE_STEP  = 0.1;
+const THROTTLE_MAX   = 1.0;
 
-let steering  = 0.0;
-let throttle  = 0.0;  // default 0 — ↑ adds 0.1 per press, ↓ resets to 0
-let recording = false;
-let paused    = false;
+let steering      = 0.0;
+let throttle      = 0.0;
+let recording     = false;
+let paused        = false;
+let steerDir      = 0;         // -1, 0, or +1
+let steerTimer    = null;
 
 function sendControl() {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -213,11 +217,31 @@ function togglePause() {
   }
 }
 
+function _stopSteerRamp() {
+  if (steerTimer !== null) { clearInterval(steerTimer); steerTimer = null; }
+  steerDir = 0;
+  steering = 0.0;
+  sendControl();
+}
+
+function _startSteerRamp(dir) {
+  if (steerDir === dir) return;   // already ramping this direction (browser key-repeat)
+  _stopSteerRamp();
+  steerDir = dir;
+  // immediate first step so short taps still register
+  steering = Math.max(-STEER_MAX, Math.min(STEER_MAX, dir * STEER_STEP));
+  sendControl();
+  steerTimer = setInterval(() => {
+    steering = Math.max(-STEER_MAX, Math.min(STEER_MAX, steering + dir * STEER_STEP));
+    sendControl();
+  }, STEER_INTERVAL);
+}
+
 document.addEventListener('keydown', (e) => {
+  if      (e.key === 'ArrowLeft')  { _startSteerRamp(-1); e.preventDefault(); return; }
+  else if (e.key === 'ArrowRight') { _startSteerRamp( 1); e.preventDefault(); return; }
   let changed = false;
-  if      (e.key === 'ArrowLeft')  { steering = -STEER_VAL; changed = true; }
-  else if (e.key === 'ArrowRight') { steering =  STEER_VAL; changed = true; }
-  else if (e.key === 'ArrowUp') {
+  if      (e.key === 'ArrowUp') {
     throttle = Math.min(THROTTLE_MAX, Math.round((throttle + THROTTLE_STEP) * 10) / 10);
     changed = true;
   }
@@ -228,10 +252,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 document.addEventListener('keyup', (e) => {
-  let changed = false;
-  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { steering = 0.0; changed = true; }
-  // ↑ and ↓ are one-shot (no reset on keyup) — throttle holds its value
-  if (changed) { e.preventDefault(); sendControl(); }
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    _stopSteerRamp();
+    e.preventDefault();
+  }
+  // ↑ and ↓ are one-shot — throttle holds its value until next press
 });
 </script>
 </body>

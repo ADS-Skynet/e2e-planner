@@ -1,17 +1,21 @@
 # Desktop training requirements
 # Ubuntu 22.04 x86_64 | Python 3.10 | RTX 5080 (Blackwell sm_120) | CUDA 12.8 driver
 #
-# PyTorch: RTX 5080 requires >= 2.6 for Blackwell (sm_120) native CUDA support.
-#          CUDA driver 12.8 is backward-compatible with cu126 wheels.
+# PyTorch: RTX 5080 (sm_120) requires PyTorch built with CUDA 12.8+.
+#          Older wheels (cu121, cu126) only support up to sm_90 and will crash
+#          with: "RuntimeError: CUDA error: no kernel image is available for execution on the device"
 #
 # Install PyTorch separately first (index URL required):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+# If the stable cu128 wheel still doesn't include sm_120, use nightly:
+#   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
 #
 # Then install the rest:
 #   pip install -r requirements_desktop.txt
 
 # ── Core training stack ───────────────────────────────────────────────────────
-torch>=2.6.0           # Blackwell sm_120 support added in 2.6
+torch>=2.6.0           # Blackwell sm_120 support; install via cu128 wheel (see above)
 torchvision>=0.21.0    # matches torch 2.6
 
 # ── Data + training utilities ─────────────────────────────────────────────────

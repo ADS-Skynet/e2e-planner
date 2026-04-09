@@ -102,7 +102,6 @@ from planner_model import (
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_THROTTLE   = 0.20   # auto-forward throttle during collection
-STEER_VALUE     = 0.9    # fixed steering magnitude for key presses
 SAVE_FPS        = 10     # max rows written per second
 
 DATA_DIR      = script_dir / "data"
@@ -329,8 +328,6 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
 
             # ── Web viewer human input ────────────────────────────────────────
             raw_steer  = web_viewer.steering if web_viewer else 0.0
-            left_held  = raw_steer < 0
-            right_held = raw_steer > 0
 
             # ── Camera frame ─────────────────────────────────────────────────
             color_bgr, depth_raw = camera.read_frames()
@@ -364,13 +361,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
             lane_detected = bool(mask.any())
 
             # ── Human steering / throttle ─────────────────────────────────────
-            if left_held and not right_held:
-                input_steering = -STEER_VALUE
-            elif right_held and not left_held:
-                input_steering = STEER_VALUE
-            else:
-                input_steering = 0.0
-
+            input_steering = raw_steer
             input_throttle = web_viewer.throttle if web_viewer else 0.0
 
             # Apply to vehicle
