@@ -40,6 +40,7 @@ import time
 import signal
 import csv
 import argparse
+import threading
 import numpy as np
 from pathlib import Path
 
@@ -89,6 +90,7 @@ from planner_model import (
     build_object_features,
     build_lane_grid,
     lane_boundaries_from_mask,
+    draw_lane_grid_overlay,
     csv_columns,
     N_MAX_OBJECTS,
     SCENARIO_LANE_FOLLOW, SCENARIO_OBSTACLE_AVOID, SCENARIO_PARKING, SCENARIO_STOP,
@@ -102,11 +104,48 @@ from planner_model import (
 BASE_THROTTLE   = 0.20   # auto-forward throttle during collection
 STEER_VALUE     = 0.9    # fixed steering magnitude for key presses
 SAVE_FPS        = 10     # max rows written per second
-YOLO_SKIP       = 3      # run YOLO every N frames (GPU memory constraint)
-
 
 DATA_DIR      = script_dir / "data"
 PLANNER_CSV   = DATA_DIR / "planner_data.csv"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YOLO background worker
+# Runs YOLO on CPU in a daemon thread — same pattern as planner_inference.py.
+# The main loop always reads the latest cached result; YOLO never blocks it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_yolo_lock    = threading.Lock()
+_yolo_cache   = {'boxes': [], 'distances': [], 'class_ids': [], 'confs': []}
+_yolo_running = False
+
+
+def _yolo_worker(yolo, frame, depth_array, depth_scale, frame_w, frame_h):
+    global _yolo_running, _yolo_cache
+    try:
+        results = yolo(frame, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD,
+                       device=YOLO_DEVICE, verbose=False)
+        boxes_r, dists_r, cids_r, confs_r = [], [], [], []
+        if len(results[0].boxes) > 0:
+            xyxy  = results[0].boxes.xyxy.cpu().numpy()
+            cids  = results[0].boxes.cls.cpu().numpy().astype(int)
+            confs = results[0].boxes.conf.cpu().numpy()
+            for box, cid, conf in zip(xyxy, cids, confs):
+                cx = int(max(0, min((box[0] + box[2]) / 2, frame_w - 1)))
+                cy = int(max(0, min((box[1] + box[3]) / 2, frame_h - 1)))
+                raw  = int(depth_array[cy, cx])
+                dist = raw * depth_scale if raw > 0 else -1.0
+                boxes_r.append(box)
+                dists_r.append(dist)
+                cids_r.append(int(cid))
+                confs_r.append(float(conf))
+        with _yolo_lock:
+            _yolo_cache = {'boxes': boxes_r, 'distances': dists_r,
+                           'class_ids': cids_r, 'confs': confs_r}
+        del results
+    except Exception as e:
+        print(f"\n[YOLO] Error: {e}")
+    finally:
+        _yolo_running = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,10 +175,10 @@ _visualizer = LKASVisualizer(image_width=FRAME_W, image_height=FRAME_H)
 
 
 def _annotate(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
-              left_x, right_x, saved_count, mask=None):
+              left_x, right_x, saved_count, mask=None, lane_feats=None):
     out = frame.copy()
 
-    # ── Lane overlay ──────────────────────────────────────────────────────────
+    # ── Lane segmentation overlay ─────────────────────────────────────────────
     if mask is not None:
         out = _visualizer.draw_segmentation(out, mask)
     else:
@@ -147,6 +186,10 @@ def _annotate(frame, boxes, distances, class_ids, scenario, steering, throttle, 
         h = out.shape[0]
         cv2.line(out, (int(left_x),  0), (int(left_x),  h), (80, 80, 160), 1)
         cv2.line(out, (int(right_x), 0), (int(right_x), h), (80, 80, 160), 1)
+
+    # ── Grid pooling overlay ──────────────────────────────────────────────────
+    if lane_feats is not None:
+        out = draw_lane_grid_overlay(out, lane_feats)
 
     for box, dist, cid in zip(boxes, distances, class_ids):
         x1, y1, x2, y2 = map(int, box)
@@ -214,7 +257,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
     print(f"  Scenario      : {sc_name} ({scenario})")
     print(f"  Output CSV    : {PLANNER_CSV}")
     print(f"  Save rate cap : {SAVE_FPS} fps")
-    print(f"  YOLO skip     : every {YOLO_SKIP} frames")
+    print(f"  YOLO          : background thread (non-blocking)")
     print(f"  Base throttle : {BASE_THROTTLE}")
     print()
     print("  Controls: ← steer left  → steer right  ↓ stop  Ctrl+C quit")
@@ -269,21 +312,15 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
     signal.signal(signal.SIGTERM, _shutdown)
 
     # ── State ─────────────────────────────────────────────────────────────────
-    prev_steering    = 0.0
-    prev_throttle    = 0.0
-    frame_id         = 1
-    saved_count      = 0
-    yolo_frame_count = 0
-    last_save_time   = 0.0
-    save_interval    = 1.0 / SAVE_FPS
-    fps              = 0.0
-    fps_count        = 0
-    fps_start        = time.time()
-
-    cached_boxes:     list = []
-    cached_distances: list = []
-    cached_class_ids: list = []
-    cached_confs:     list = []
+    prev_steering  = 0.0
+    prev_throttle  = 0.0
+    frame_id       = 1
+    saved_count    = 0
+    last_save_time = 0.0
+    save_interval  = 1.0 / SAVE_FPS
+    fps            = 0.0
+    fps_count      = 0
+    fps_start      = time.time()
 
     print(f"\n[COLLECT] Running — Ctrl+C to stop\n")
 
@@ -303,45 +340,23 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
             depth_array = depth_raw if depth_raw is not None else \
                           np.zeros((FRAME_H, FRAME_W), dtype=np.uint16)
 
-            # ── YOLO (every YOLO_SKIP frames, on CPU) ─────────────────────────
-            yolo_frame_count += 1
-            if yolo_frame_count % YOLO_SKIP == 0:
-                try:
-                    results = yolo(
-                        color_bgr,
-                        conf=CONFIDENCE_THRESHOLD,
-                        iou=IOU_THRESHOLD,
-                        device=YOLO_DEVICE,
-                        verbose=False,
-                    )
-                    boxes_raw, dists_raw, cids_raw, confs_raw = [], [], [], []
-                    if len(results[0].boxes) > 0:
-                        xyxy   = results[0].boxes.xyxy.cpu().numpy()
-                        cids   = results[0].boxes.cls.cpu().numpy().astype(int)
-                        confs  = results[0].boxes.conf.cpu().numpy()
-                        for box, cid, conf in zip(xyxy, cids, confs):
-                            cx = int((box[0] + box[2]) / 2)
-                            cy = int((box[1] + box[3]) / 2)
-                            cx = max(0, min(cx, FRAME_W - 1))
-                            cy = max(0, min(cy, FRAME_H - 1))
-                            raw  = int(depth_array[cy, cx])
-                            dist = raw * depth_scale if raw > 0 else -1.0
-                            boxes_raw.append(box)
-                            dists_raw.append(dist)
-                            cids_raw.append(int(cid))
-                            confs_raw.append(float(conf))
-                    cached_boxes     = boxes_raw
-                    cached_distances = dists_raw
-                    cached_class_ids = cids_raw
-                    cached_confs     = confs_raw
-                    del results  # free GPU tensors immediately
-                except Exception as e:
-                    print(f"\n[YOLO] Error: {e}")
+            # ── YOLO (background thread — never blocks the main loop) ─────────
+            global _yolo_running
+            if not _yolo_running:
+                _yolo_running = True
+                threading.Thread(
+                    target=_yolo_worker,
+                    args=(yolo, color_bgr.copy(), depth_array.copy(),
+                          depth_scale, FRAME_W, FRAME_H),
+                    daemon=True,
+                ).start()
 
-            boxes     = cached_boxes
-            distances = cached_distances
-            class_ids = cached_class_ids
-            confs     = cached_confs
+            with _yolo_lock:
+                r = _yolo_cache
+            boxes     = r['boxes']
+            distances = r['distances']
+            class_ids = r['class_ids']
+            confs     = r['confs']
 
             # ── Lane segmentation (BiSeNet, every frame) ─────────────────────
             mask = lane_seg.infer(color_bgr)
@@ -420,7 +435,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                     color_bgr, boxes, distances, class_ids,
                     scenario, input_steering, input_throttle, fps,
                     left_lane_x, right_lane_x, saved_count,
-                    mask=mask,
+                    mask=mask, lane_feats=lane_feats,
                 )
                 web_viewer.broadcast_frame(annotated)
                 web_viewer.broadcast_status({

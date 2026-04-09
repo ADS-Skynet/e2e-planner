@@ -270,44 +270,53 @@ Terminal 2 (infer):    python planner_inference.py --scenario 0 [--motor]
 ### Memory management (Jetson Orin Nano)
 
 Jetson Orin Nano has **7.4 GB unified memory** shared between CPU and GPU.
-Running LKAS (BiSeNet on CPU) + YOLO (GPU) + RealSense simultaneously puts
-pressure on this pool. Without care, YOLO inference raises:
+`LaneSeg` (BiSeNet, `device="auto"`) claims the GPU on startup. Running YOLO
+on the GPU simultaneously causes OOM:
 
 ```
 NvMapMemAllocInternalTagged failed: error 12 (out of memory)
 RuntimeError: CUDA out of memory
 ```
 
-Three techniques keep memory under control — both `collect_data_planner.py`
-and `planner_inference.py` apply all three:
+**How we hit this and what fixed it**
 
-**Device split (inference only)**
+When OOM was first seen, we monitored live usage in a separate terminal:
 
-LKAS BiSeNet (`--method dl`, `device="auto"`) claims the GPU on Jetson.
-YOLO + BiSeNet on GPU simultaneously causes OOM. Solution: YOLO and planner
-both run on CPU during inference; GPU is reserved exclusively for BiSeNet.
+```bash
+tegrastats --interval 500
+```
 
-| Script | YOLO device | Planner device | LKAS BiSeNet |
-|--------|-------------|----------------|--------------|
-| `collect_data_planner.py` | GPU | — | GPU |
+This showed GPU memory was being saturated by two models running on CUDA at
+the same time. The first-of-first fix was one line — force YOLO to CPU:
+
+```python
+YOLO_DEVICE = 'cpu'   # in both collect_data_planner.py and planner_inference.py
+```
+
+That alone resolved the OOM. All further techniques below are secondary.
+
+**Device split (current setup)**
+
+GPU is reserved exclusively for `LaneSeg` (BiSeNet). Everything else runs on CPU.
+
+| Script | YOLO device | Planner device | LaneSeg (BiSeNet) |
+|--------|-------------|----------------|-------------------|
+| `collect_data_planner.py` | CPU | — | GPU |
 | `planner_inference.py` | CPU | CPU | GPU |
 
-collect_data works with YOLO on GPU because it was designed before the DL
-lane detector was confirmed on GPU. If collect_data also starts OOMing, move
-its `YOLO_DEVICE` to `'cpu'` as well.
-
-**Per-frame GPU memory techniques**
+**Additional techniques**
 
 | Technique | What it does | Where |
 |-----------|-------------|-------|
-| `half=torch.cuda.is_available()` | FP16 YOLO — halves VRAM (collect_data only, GPU YOLO) | YOLO call |
-| `del results` immediately after extracting boxes | Releases GPU tensors before next frame | after YOLO loop |
-| `YOLO_SKIP = 3` | YOLO runs every 3rd frame; cached detections used on skipped frames | top of file |
+| `del results` immediately after extracting boxes | Releases YOLO CPU tensors before next frame | after YOLO loop |
+| `YOLO_SKIP = 3` (collect_data only) | YOLO runs every 3rd frame; cached result reused | top of file |
+| Background thread (inference only) | YOLO runs in daemon thread; never blocks main loop | `_yolo_worker()` |
 
 **Do not** call `torch.cuda.empty_cache()` before inference — it flushes the
 CUDA allocator cache, which paradoxically causes more fragmentation and OOM
-errors in practice on Jetson.
+on Jetson.
 
-If OOM still occurs:
-- Increase `YOLO_SKIP` to 4 or 5 in both scripts
-- Monitor with `tegrastats` in a separate terminal
+If OOM still occurs after the CPU fix:
+- Confirm `tegrastats` shows BiSeNet is the only GPU user
+- Increase `YOLO_SKIP` to 4 or 5 in `collect_data_planner.py`
+- Reduce `LaneSeg` input size (edit `_INPUT_H`/`_INPUT_W` in `lane_seg.py`)

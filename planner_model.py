@@ -191,6 +191,78 @@ def lane_boundaries_from_mask(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Grid visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_lane_grid_overlay(
+    frame: "np.ndarray",
+    grid_features: list,
+    alpha: float = 0.45,
+) -> "np.ndarray":
+    """
+    Draw the 4×8 lane-fraction grid as a semi-transparent overlay on *frame*.
+
+    Each cell is shaded green with intensity proportional to its lane fraction.
+    Grid lines are drawn in translucent white.  The fraction value is printed
+    inside every cell so you can read the exact model input while driving.
+
+    Call this *after* draw_segmentation() so the grid appears on top.
+
+    Args:
+        frame:         BGR image, already annotated with lane segmentation
+        grid_features: 32 floats from build_lane_grid() — row-major [r0c0 … r3c7]
+        alpha:         blend weight of the grid layer (default 0.45)
+
+    Returns:
+        New BGR image with grid overlay blended in.
+    """
+    import cv2
+    import numpy as _np
+
+    h, w   = frame.shape[:2]
+    cell_h = h // GRID_ROWS   # 120 for 480-px frames
+    cell_w = w // GRID_COLS   # 106 for 848-px frames
+
+    overlay = frame.copy()
+
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            frac = float(grid_features[r * GRID_COLS + c])
+            y1 = r * cell_h
+            y2 = y1 + cell_h
+            x1 = c * cell_w
+            x2 = x1 + cell_w
+
+            # Cell fill — bright green, intensity ∝ lane fraction
+            if frac > 0.02:
+                intensity = int(60 + 195 * frac)   # 60 (dim) … 255 (full)
+                cv2.rectangle(overlay, (x1, y1), (x2, y2),
+                              (0, intensity, 0), -1)  # BGR green
+
+            # Fraction label in cell centre
+            label = f"{frac:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+            tx = x1 + (cell_w - tw) // 2
+            ty = y1 + (cell_h + th) // 2
+            cv2.putText(overlay, label, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+
+    # Blend cell fills with the incoming frame
+    blended = cv2.addWeighted(frame, 1.0 - alpha, overlay, alpha, 0)
+
+    # Draw grid lines on top (always fully opaque)
+    for r in range(GRID_ROWS + 1):
+        y = r * cell_h
+        cv2.line(blended, (0, y), (w, y), (180, 180, 180), 1, cv2.LINE_AA)
+    for c in range(GRID_COLS + 1):
+        x = c * cell_w
+        cv2.line(blended, (x, 0), (x, h), (180, 180, 180), 1, cv2.LINE_AA)
+
+    return blended
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 

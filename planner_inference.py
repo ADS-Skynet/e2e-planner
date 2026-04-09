@@ -91,6 +91,7 @@ from planner_model import (
     build_object_features,
     build_lane_grid,
     lane_boundaries_from_mask,
+    draw_lane_grid_overlay,
     MAX_THROTTLE,
     FRAME_W, FRAME_H,
     SCENARIO_LANE_FOLLOW, SCENARIO_OBSTACLE_AVOID, SCENARIO_PARKING, SCENARIO_STOP,
@@ -162,7 +163,7 @@ _BOX_COLORS = [
 
 
 def _draw(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
-          left_x, right_x, mask=None):
+          left_x, right_x, mask=None, lane_feats=None):
     out = frame.copy()
 
     # ── Lane segmentation overlay ─────────────────────────────────────────────
@@ -172,6 +173,10 @@ def _draw(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
         h = out.shape[0]
         cv2.line(out, (int(left_x), 0), (int(left_x), h), (80, 80, 160), 1)
         cv2.line(out, (int(right_x), 0), (int(right_x), h), (80, 80, 160), 1)
+
+    # ── Grid pooling overlay ──────────────────────────────────────────────────
+    if lane_feats is not None:
+        out = draw_lane_grid_overlay(out, lane_feats)
 
     for box, dist, cid in zip(boxes, distances, class_ids):
         x1, y1, x2, y2 = map(int, box)
@@ -450,7 +455,8 @@ def main(
             if web_viewer is not None:
                 annotated = _draw(color_bgr, boxes, distances, class_ids,
                                   scenario, final_steering, final_throttle, fps,
-                                  left_x, right_x, mask=mask)
+                                  left_x, right_x, mask=mask,
+                                  lane_feats=lane_t[0].tolist())
                 web_viewer.broadcast_frame(annotated)
                 web_viewer.broadcast_status({
                     'fps':              fps,
