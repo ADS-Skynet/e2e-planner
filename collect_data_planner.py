@@ -290,7 +290,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
     if JETRACER_AVAILABLE:
         print("\n[CAR] Initializing NvidiaRacecar...")
         car = NvidiaRacecar()
-        car.steering_offset = 0.05
+        car.steering_offset = 0.35 # 0.05
         car.steering = 0.0
         car.throttle = 0.0
         print("[CAR] Ready")

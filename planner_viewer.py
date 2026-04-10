@@ -10,11 +10,19 @@ Provides:
   - JSON status panel (scenario, steering, throttle, fps, objects, lane)
   - Keyboard controls → steering / stop state readable by the main loop
 
-Controls (browser)
-  ←  steer left   (held)
-  →  steer right  (held)
-  ↓  stop         (held)
-  releasing any key resets that axis to 0
+Controls (browser keyboard)
+  ← / →  steer — tap=0.3, hold 300ms=0.6, hold 600ms=0.9
+  ↑      throttle +0.1
+  ↓      throttle = 0
+  Space  toggle recording
+  P      pause/resume
+
+Controls (gamepad — Xbox 360 via xboxdrv, no kernel modules needed)
+  Left  stick X  throttle (push right = 0→0.45; release = 0)
+  Right stick X  steer (continuous ±1.0, deadzone 0.05)
+  LT             emergency throttle = 0
+  Start          toggle recording
+  Back           pause/resume
 
 Usage
 -----
@@ -43,7 +51,6 @@ Usage
 import asyncio
 import json
 import time
-import threading
 import cv2
 import numpy as np
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -109,7 +116,7 @@ _HTML = """<!DOCTYPE html>
 <div class="steer-bar">
   <div class="steer-indicator" id="steer-indicator" style="left:50%"></div>
 </div>
-<div id="ctrl">← / → steer (hold = ramp ±0.05/100ms) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause</div>
+<div id="ctrl">← / → steer (tap=0.3 · hold 300ms=0.6 · hold 600ms=0.9) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause</div>
 
 <script>
 const canvas = document.getElementById('feed');
@@ -176,18 +183,20 @@ function connect() {
 }
 connect();
 
-// ── Key controls ────────────────────────────────────────────────────────────
-const STEER_STEP     = 0.05;   // increment per ramp tick
-const STEER_INTERVAL = 100;    // ms between ramp ticks
-const STEER_MAX      = 1.0;
-const THROTTLE_STEP  = 0.1;
-const THROTTLE_MAX   = 1.0;
+// ── Controls ─────────────────────────────────────────────────────────────────
+// Graduated steering: tap = 0.3, hold 300 ms = 0.6, hold 600 ms = 0.9
+// Captures intermediate values in the CSV, not just ±0.9.
+const STEER_LEVELS   = [0.3, 0.6, 0.9];
+const STEER_HOLD_MS  = 300;
+const THROTTLE_STEP  = 0.05;
+const THROTTLE_MAX   = 0.4;
 
 let steering      = 0.0;
 let throttle      = 0.0;
 let recording     = false;
 let paused        = false;
-let steerDir      = 0;         // -1, 0, or +1
+let steerDir      = 0;
+let steerLevel    = 0;
 let steerTimer    = null;
 
 function sendControl() {
@@ -219,22 +228,26 @@ function togglePause() {
 
 function _stopSteerRamp() {
   if (steerTimer !== null) { clearInterval(steerTimer); steerTimer = null; }
-  steerDir = 0;
-  steering = 0.0;
+  steerDir   = 0;
+  steerLevel = 0;
+  steering   = 0.0;
   sendControl();
 }
 
 function _startSteerRamp(dir) {
-  if (steerDir === dir) return;   // already ramping this direction (browser key-repeat)
+  if (steerDir === dir) return;   // suppress browser key-repeat
   _stopSteerRamp();
-  steerDir = dir;
-  // immediate first step so short taps still register
-  steering = Math.max(-STEER_MAX, Math.min(STEER_MAX, dir * STEER_STEP));
+  steerDir   = dir;
+  steerLevel = 0;
+  steering   = dir * STEER_LEVELS[0];   // immediate 0.3 on first press
   sendControl();
   steerTimer = setInterval(() => {
-    steering = Math.max(-STEER_MAX, Math.min(STEER_MAX, steering + dir * STEER_STEP));
-    sendControl();
-  }, STEER_INTERVAL);
+    if (steerLevel < STEER_LEVELS.length - 1) {
+      steerLevel++;
+      steering = dir * STEER_LEVELS[steerLevel];
+      sendControl();
+    }
+  }, STEER_HOLD_MS);
 }
 
 document.addEventListener('keydown', (e) => {
@@ -256,7 +269,6 @@ document.addEventListener('keyup', (e) => {
     _stopSteerRamp();
     e.preventDefault();
   }
-  // ↑ and ↓ are one-shot — throttle holds its value until next press
 });
 </script>
 </body>
@@ -282,7 +294,7 @@ class _HTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
+    def log_message(self, *args):
         pass  # silence access log
 
 
@@ -298,7 +310,8 @@ class PlannerViewer:
       .stop_held  bool   — True while ↓ is held
     """
 
-    STEER_VALUE = 0.9   # magnitude applied when ← or → held
+    STEER_VALUE    = 1.0   # JS and gamepad both output final values directly; no extra scaling
+    FULL_THROTTLE  = 0.35  # maximum throttle value; right stick X and keyboard scale to this
 
     def __init__(self, http_port: int = 8082, ws_port: int = 8083):
         self._http_port = http_port
@@ -317,6 +330,7 @@ class PlannerViewer:
         self._http_server: Optional[ThreadingHTTPServer] = None
         self._http_thread: Optional[Thread] = None
         self._ws_thread:   Optional[Thread] = None
+        self._gp_thread:   Optional[Thread] = None
 
     # ── Public state ──────────────────────────────────────────────────────────
 
@@ -390,6 +404,9 @@ class PlannerViewer:
                 time.sleep(0.05)
                 waited += 0.05
 
+        self._gp_thread = Thread(target=self._run_gamepad, daemon=True)
+        self._gp_thread.start()
+
         print(f"[PlannerViewer] http://0.0.0.0:{self._http_port}   ws://0.0.0.0:{self._ws_port}")
 
     def stop(self):
@@ -400,6 +417,105 @@ class PlannerViewer:
                 pass
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
+
+    # ── Gamepad thread ────────────────────────────────────────────────────────
+
+    def _run_gamepad(self):
+        """
+        Read Xbox 360 controller via `xboxdrv --no-uinput -v` subprocess.
+        No kernel modules (xpad/uinput) required — xboxdrv accesses USB directly.
+
+        Requires non-root USB access (run once):
+          echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="028e", MODE="0666"' \\
+            | sudo tee /etc/udev/rules.d/99-xbox.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger
+
+        xboxdrv stdout format (line per state change):
+          X1:<int> Y1:<int>  X2:<int> Y2:<int>  ... back:<0|1> ... start:<0|1>  ... LT:<int> RT:<int>
+
+        Mapping:
+          X2 (right stick X)   → steering  (±1.0, deadzone 0.05)
+          Y1 (left  stick Y)   → throttle (up = forward, down = reverse, ±FULL_THROTTLE)
+          X2 (right stick X)   → steering (left = −1, right = +1)
+          LT                  → emergency throttle = 0  (threshold 64/255)
+          RB  (R1)            → record toggle  (on press)
+          RT  (R2)            → pause toggle   (on press, threshold 64/255)
+        """
+        import re
+        import shutil
+        import subprocess
+
+        _DEADZONE  = 0.05
+        _AXIS_MAX  = 32767.0
+        _LT_THRESH = 64          # LT > this → emergency stop
+
+        if not shutil.which('xboxdrv'):
+            print("[PlannerViewer] xboxdrv not found — gamepad disabled")
+            return
+
+        _pat = re.compile(
+            r'Y1:\s*(-?\d+).*?X2:\s*(-?\d+)'
+            r'.*?RB:(\d)'
+            r'.*?LT:\s*(\d+).*?RT:\s*(\d+)'
+        )
+
+        try:
+            proc = subprocess.Popen(
+                ['xboxdrv', '--no-uinput', '-v'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # merge stderr into stdout so we catch state lines
+                text=True,
+            )
+        except Exception as e:
+            print(f"[PlannerViewer] xboxdrv launch failed: {e}")
+            return
+
+        print("[PlannerViewer] Gamepad connected (Xbox 360 via xboxdrv)")
+
+        prev_rb = 0
+        prev_rt = 0
+
+        for line in proc.stdout:
+            m = _pat.search(line)
+            if not m:
+                continue
+
+            y1  = int(m.group(1)) / _AXIS_MAX   # left  stick Y → throttle
+            x2  = int(m.group(2)) / _AXIS_MAX   # right stick X → steering
+            rb  = int(m.group(3))               # RB (R1) → record toggle
+            lt  = int(m.group(4))               # LT      → emergency stop
+            rt  = int(m.group(5))               # RT (R2) → pause toggle
+
+            # ── Throttle: left stick Y (up = forward, down = reverse) ─────
+            thr = 0.0 if abs(y1) < _DEADZONE or lt > _LT_THRESH \
+                  else y1 * self.FULL_THROTTLE
+            with self._lock:
+                self._throttle = round(max(-self.FULL_THROTTLE, min(self.FULL_THROTTLE, thr)), 3)
+
+            # ── Steering: right stick X ───────────────────────────────────
+            steer = 0.0 if abs(x2) < _DEADZONE else round(x2, 3)
+            with self._lock:
+                self._steering = max(-1.0, min(1.0, steer))
+
+            # ── Buttons: detect 0→1 press transition ─────────────────────
+            rb_pressed = rb == 1 and prev_rb == 0
+            rt_pressed = rt > _LT_THRESH and prev_rt <= _LT_THRESH
+
+            if rb_pressed:
+                with self._lock:
+                    self._recording = not self._recording
+                print(f"[Gamepad] Recording {'ON' if self._recording else 'OFF'}")
+
+            if rt_pressed:
+                with self._lock:
+                    self._paused = not self._paused
+                print(f"[Gamepad] {'PAUSED' if self._paused else 'RUNNING'}")
+
+            prev_rb = rb
+            prev_rt = rt
+
+        proc.wait()
+        print("[PlannerViewer] Gamepad disconnected")
 
     # ── HTTP server ───────────────────────────────────────────────────────────
 
@@ -454,7 +570,7 @@ class PlannerViewer:
                         raw_thr   = float(msg.get('throttle', 0.0))
                         with self._lock:
                             self._steering = max(-1.0, min(1.0, raw_steer))
-                            self._throttle = max(0.0,  min(1.0, raw_thr))
+                            self._throttle = max(-self.FULL_THROTTLE, min(self.FULL_THROTTLE, raw_thr))
                     elif msg.get('type') == 'record_toggle':
                         with self._lock:
                             self._recording = not self._recording
