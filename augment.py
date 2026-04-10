@@ -30,6 +30,7 @@ Usage
   python augment.py [--input data/planner_data.csv]
                     [--output data/augmented_data.csv]
                     [--seed 42]
+                    [--smooth 5]   # rolling-mean window; 1 = disabled
 """
 
 import argparse
@@ -206,7 +207,8 @@ AUGMENTATIONS = [
 ]
 
 
-def augment(input_csv: Path, output_csv: Path, seed: int = 42) -> None:
+def augment(input_csv: Path, output_csv: Path, seed: int = 42,
+            smooth_window: int = 5) -> None:
     print("=" * 58)
     print("  Planner Dataset Augmentation")
     print("=" * 58)
@@ -233,6 +235,23 @@ def augment(input_csv: Path, output_csv: Path, seed: int = 42) -> None:
     if "target_steering" in df.columns:
         print(f"[AUG] Steering distribution (original):")
         print(df["target_steering"].describe().to_string())
+        print()
+
+    # ── Label smoothing ───────────────────────────────────────────────────────
+    # Apply a centred rolling mean to target_steering before augmenting.
+    # This reduces frame-to-frame joystick jitter without shifting the overall
+    # steering signal.  window=1 disables smoothing.
+    if smooth_window > 1:
+        raw_std  = df["target_steering"].std()
+        df["target_steering"] = (
+            df["target_steering"]
+            .rolling(smooth_window, center=True, min_periods=1)
+            .mean()
+            .clip(-1.0, 1.0)
+        )
+        new_std = df["target_steering"].std()
+        print(f"[AUG] Label smoothing: window={smooth_window}  "
+              f"std {raw_std:.4f} → {new_std:.4f}")
         print()
 
     rng = np.random.default_rng(seed)
@@ -305,6 +324,9 @@ if __name__ == "__main__":
                         help='Output CSV (default: data/augmented_data.csv)')
     parser.add_argument('--seed',   type=int, default=42,
                         help='Random seed (default: 42)')
+    parser.add_argument('--smooth', type=int, default=5,
+                        help='Rolling-mean window for steering label smoothing '
+                             '(default: 5, use 1 to disable)')
     args = parser.parse_args()
 
-    augment(args.input, args.output, args.seed)
+    augment(args.input, args.output, args.seed, args.smooth)

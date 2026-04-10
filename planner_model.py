@@ -13,7 +13,7 @@ Feature layout
 Objects   : N_MAX_OBJECTS rows × OBJ_FEATURES cols  (sorted by distance, padded with zeros)
   [valid, class_norm, confidence, dist_norm, lat_offset, width_norm, height_norm, lane_overlap]
 
-Lane      : LANE_FEATURES cols  (4×8 spatial grid from BiSeNet mask)
+Lane      : LANE_FEATURES cols  (6×12 spatial grid from BiSeNet mask)
   [lane_r0c0 … lane_r3c7]  per-cell lane fraction [0.0–1.0], row-major
 
 Ego state : EGO_FEATURES cols
@@ -35,15 +35,15 @@ import torch.nn as nn
 # ─────────────────────────────────────────────────────────────────────────────
 N_MAX_OBJECTS = 5      # objects tracked per frame (padded to this length)
 OBJ_FEATURES  = 8     # features per object slot
-GRID_ROWS     = 4     # spatial grid rows (far → near)
-GRID_COLS     = 8     # spatial grid columns (left → right)
-LANE_FEATURES = GRID_ROWS * GRID_COLS   # 32 — spatial grid of lane fractions
+GRID_ROWS     = 6     # spatial grid rows (far → near)
+GRID_COLS     = 12    # spatial grid columns (left → right)
+LANE_FEATURES = GRID_ROWS * GRID_COLS   # 72 — spatial grid of lane fractions
 EGO_FEATURES  = 2     # ego state features (prev_steering, prev_throttle)
 N_SCENARIOS   = 4     # scenario vocabulary size
 SCENARIO_DIM  = 8     # embedding dimension for scenario token
 
 OBJECT_BLOCK_DIM = N_MAX_OBJECTS * OBJ_FEATURES   # 40
-TOTAL_FLAT_DIM   = OBJECT_BLOCK_DIM + LANE_FEATURES + EGO_FEATURES  # 74
+TOTAL_FLAT_DIM   = OBJECT_BLOCK_DIM + LANE_FEATURES + EGO_FEATURES  # 114
 
 # Fallback lane boundary x-coordinates when the mask contains no lane pixels
 FIXED_LEFT_LANE_X  = 255
@@ -274,7 +274,7 @@ class PlannerModel(nn.Module):
 
     Inputs (all float32 except scenario which is long):
       objects  : (B, N_MAX_OBJECTS * OBJ_FEATURES)   40-dim
-      lane     : (B, LANE_FEATURES)                   32-dim  (4×8 spatial grid)
+      lane     : (B, LANE_FEATURES)                   72-dim  (6×12 spatial grid)
       ego      : (B, EGO_FEATURES)                    2-dim
       scenario : (B,)                                 long
     """
@@ -282,26 +282,30 @@ class PlannerModel(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Object encoder: sees all objects jointly so it can reason about relations
+        # Object encoder
         self.obj_enc = nn.Sequential(
-            nn.Linear(OBJECT_BLOCK_DIM, 64),
-            nn.LayerNorm(64),
+            nn.Linear(OBJECT_BLOCK_DIM, 128),
+            nn.LayerNorm(128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
         )
 
-        # Lane encoder — two layers to handle 32-cell spatial grid
+        # Lane encoder — wider + deeper to exploit the 6×12 spatial grid
         self.lane_enc = nn.Sequential(
-            nn.Linear(LANE_FEATURES, 64),
+            nn.Linear(LANE_FEATURES, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 32),
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
         )
 
         # Ego encoder
         self.ego_enc = nn.Sequential(
-            nn.Linear(EGO_FEATURES, 16),
+            nn.Linear(EGO_FEATURES, 32),
             nn.ReLU(inplace=True),
         )
 
@@ -309,22 +313,25 @@ class PlannerModel(nn.Module):
         self.scenario_embed = nn.Embedding(N_SCENARIOS, SCENARIO_DIM)
 
         # Fusion + output
-        fused_dim = 64 + 32 + 16 + SCENARIO_DIM  # 120
+        fused_dim = 64 + 64 + 32 + SCENARIO_DIM  # 168
         self.shared_trunk = nn.Sequential(
-            nn.Linear(fused_dim, 64),
+            nn.Linear(fused_dim, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
-            nn.Linear(64, 32),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
         )
 
-        # Separate heads: different activation + scale per output
+        # Separate heads
         self.steering_head = nn.Sequential(
-            nn.Linear(32, 1),
+            nn.Linear(64, 1),
             nn.Tanh(),                # steering  ∈ [-1, 1]
         )
         self.throttle_head = nn.Sequential(
-            nn.Linear(32, 1),
+            nn.Linear(64, 1),
             nn.Sigmoid(),             # throttle  ∈ [0, 1]  (multiply by MAX_THROTTLE)
         )
 
@@ -341,8 +348,8 @@ class PlannerModel(nn.Module):
         e = self.ego_enc(ego)
         s = self.scenario_embed(scenario)
 
-        fused  = torch.cat([o, l, e, s], dim=1)    # (B, 120)
-        trunk  = self.shared_trunk(fused)            # (B, 32)
+        fused  = torch.cat([o, l, e, s], dim=1)    # (B, 168)
+        trunk  = self.shared_trunk(fused)            # (B, 64)
 
         steering = self.steering_head(trunk)         # (B, 1) ∈ [-1, 1]
         throttle = self.throttle_head(trunk)         # (B, 1) ∈ [ 0, 1]
