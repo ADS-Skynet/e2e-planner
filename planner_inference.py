@@ -133,11 +133,7 @@ def extract_features(
         frame_w=FRAME_W, frame_h=FRAME_H, n_classes=N_YOLO_CLASSES,
     )
     lane_feats = build_lane_grid(mask)
-    # NOTE: training data used MAX_THROTTLE=0.30 for ego normalisation (stored
-    # values are 0.35/0.30 ≈ 1.167).  Use the same divisor here so the model
-    # sees the same input distribution.  Update to MAX_THROTTLE after retrain.
-    _EGO_THR_DIV = 0.30
-    ego_feats  = [prev_steering, prev_throttle / _EGO_THR_DIV]
+    ego_feats  = [prev_steering, prev_throttle / MAX_THROTTLE]
 
     objects_t = torch.tensor(obj_feats,  dtype=torch.float32, device=device).unsqueeze(0)
     lane_t    = torch.tensor(lane_feats, dtype=torch.float32, device=device).unsqueeze(0)
@@ -350,7 +346,7 @@ def main(
 
     # ── State ─────────────────────────────────────────────────────────────────
     prev_steering = 0.0
-    prev_throttle = MAX_THROTTLE   # warm-start: ego sees ≈1.167 (matches training distribution)
+    prev_throttle = 0.0
 
     fps       = 0.0
     fps_count = 0

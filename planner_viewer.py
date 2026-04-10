@@ -438,8 +438,8 @@ class PlannerViewer:
           Y1 (left  stick Y)   → throttle (up = forward, down = reverse, ±FULL_THROTTLE)
           X2 (right stick X)   → steering (left = −1, right = +1)
           LT                  → emergency throttle = 0  (threshold 64/255)
-          RB  (R1)            → record toggle  (on press)
-          RT  (R2)            → pause toggle   (on press, threshold 64/255)
+          RB  (R1)            → start/resume recording  (on press)
+          RT  (R2)            → pause recording         (on press, threshold 64/255)
         """
         import re
         import shutil
@@ -503,13 +503,13 @@ class PlannerViewer:
 
             if rb_pressed:
                 with self._lock:
-                    self._recording = not self._recording
-                print(f"[Gamepad] Recording {'ON' if self._recording else 'OFF'}")
+                    self._recording = True
+                print("[Gamepad] Recording ON")
 
             if rt_pressed:
                 with self._lock:
-                    self._paused = not self._paused
-                print(f"[Gamepad] {'PAUSED' if self._paused else 'RUNNING'}")
+                    self._recording = False
+                print("[Gamepad] Recording OFF")
 
             prev_rb = rb
             prev_rt = rt
