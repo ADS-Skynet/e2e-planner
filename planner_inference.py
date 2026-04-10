@@ -312,8 +312,9 @@ def main(
     if enable_motor and JETRACER_AVAILABLE:
         car = NvidiaRacecar()
         car.steering_offset = 0.05
-        car.steering = 0.0
         car.throttle = 0.0
+        car.steering = 0.0
+        time.sleep(0.2)   # wait for servo to physically centre before starting
         print("[CAR] NvidiaRacecar ready — MOTORS ACTIVE")
     else:
         print("[CAR] Simulation mode (motor control disabled)")
@@ -476,6 +477,7 @@ def main(
         if car is not None:
             car.throttle = 0.0
             car.steering = 0.0
+            time.sleep(0.3)   # hold neutral long enough for servo to physically reach centre
         try: camera.close()
         except Exception: pass
         if web_viewer is not None:
