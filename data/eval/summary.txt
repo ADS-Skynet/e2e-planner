@@ -1,15 +1,15 @@
 ==========================================================
   OVERALL RESULTS
 ==========================================================
-  Samples          : 3137
-  Steering MAE     : 0.1559
-  Steering RMSE    : 0.2775
-  Throttle MAE     : 0.0545 (m/s equiv)
-  Throttle RMSE    : 0.0665
+  Samples          : 9450
+  Steering MAE     : 0.1633
+  Steering RMSE    : 0.2781
+  Throttle MAE     : 0.0513 (m/s equiv)
+  Throttle RMSE    : 0.0580
 
   PER-SCENARIO RESULTS
 ----------------------------------------------------------
   Scenario                  N   Steer MAE   Steer RMSE   Thtl MAE
 ----------------------------------------------------------
-  LANE_FOLLOW            3137      0.1559       0.2775     0.0545
+  LANE_FOLLOW            9450      0.1633       0.2781     0.0513
 ==========================================================
