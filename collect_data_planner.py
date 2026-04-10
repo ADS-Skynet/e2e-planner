@@ -7,7 +7,7 @@ Camera + YOLO + LKAS run as usual, but instead of saving raw images
 we log a single CSV row of normalised feature vectors per frame.
 
   Camera → YOLO     → object features  ─┐
-  Camera → LaneSeg  → lane grid (32)   ─┤→ one CSV row  →  planner_data.csv
+  Camera → LaneSeg  → lane grid (72)   ─┤→ one CSV row  →  planner_data.csv
   web-viewer → human steering/throttle ─┘
 
 No .jpg / .npy files are created. The dataset is a plain CSV.
@@ -216,14 +216,33 @@ def _annotate(frame, boxes, distances, class_ids, scenario, steering, throttle, 
 
 def _init_csv(csv_path: Path):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    exists = csv_path.exists()
-    fh     = open(csv_path, "a", newline="")
-    writer = csv.writer(fh)
-    if not exists:
-        writer.writerow(csv_columns())
-        print(f"[CSV] Created new dataset: {csv_path}")
+    expected = csv_columns()
+
+    if csv_path.exists():
+        # Check schema matches current planner_model constants
+        with open(csv_path) as _f:
+            existing_cols = _f.readline().strip().split(',')
+        if existing_cols == expected:
+            fh = open(csv_path, "a", newline="")
+            writer = csv.writer(fh)
+            print(f"[CSV] Appending to existing dataset: {csv_path}  "
+                  f"({sum(1 for _ in open(csv_path)) - 1} rows)")
+        else:
+            # Schema mismatch (e.g. grid size changed) — back up old file
+            backup = csv_path.with_suffix(f".bak{int(time.time())}.csv")
+            csv_path.rename(backup)
+            print(f"[CSV] Schema changed ({len(existing_cols)} cols → {len(expected)} cols)")
+            print(f"[CSV] Old data backed up to {backup.name}")
+            fh = open(csv_path, "w", newline="")
+            writer = csv.writer(fh)
+            writer.writerow(expected)
+            print(f"[CSV] Created new dataset: {csv_path}")
     else:
-        print(f"[CSV] Appending to existing dataset: {csv_path}")
+        fh = open(csv_path, "w", newline="")
+        writer = csv.writer(fh)
+        writer.writerow(expected)
+        print(f"[CSV] Created new dataset: {csv_path}")
+
     return fh, writer
 
 
