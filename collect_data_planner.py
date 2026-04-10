@@ -16,15 +16,18 @@ Usage
 -----
   python collect_data_planner.py [--web-port 8082] [--scenario 0]
 
-Scenarios (--scenario)
-  0 = LANE_FOLLOW       normal track driving
-  1 = OBSTACLE_AVOID    driving with obstacles present
-  2 = PARKING           parking manoeuvre
-  3 = STOP              deliberate stop / e-stop demo
+Scenarios (--scenario default, or switch live with 0-5 keys in viewer)
+  0 = LANE_FOLLOW    normal driving (obstacle avoidance implicit via YOLO)
+  1 = LEFT_TURN      turning left at junction
+  2 = RIGHT_TURN     turning right at junction
+  3 = GO_STRAIGHT    straight through intersection / past stop line
+  4 = PULL_OVER      pulling over to roadside
+  5 = PARKING        parking manoeuvre
 
 Controls (web viewer browser)
   ← / →   steer left / right  (held key → ±STEER_VALUE)
   ↓        throttle = 0        (full stop)
+  0-5      switch scenario token live
   Ctrl+C   quit and save
 
 Run standalone — no LKAS required.
@@ -93,7 +96,9 @@ from planner_model import (
     draw_lane_grid_overlay,
     csv_columns,
     N_MAX_OBJECTS,
-    SCENARIO_LANE_FOLLOW, SCENARIO_OBSTACLE_AVOID, SCENARIO_PARKING, SCENARIO_STOP,
+    SCENARIO_LANE_FOLLOW, SCENARIO_LEFT_TURN, SCENARIO_RIGHT_TURN,
+    SCENARIO_GO_STRAIGHT, SCENARIO_PULL_OVER, SCENARIO_PARKING,
+    SCENARIO_NAMES,
     MAX_THROTTLE,
     FRAME_W, FRAME_H,
 )
@@ -154,16 +159,13 @@ import cv2
 
 _MODE_COLORS = {
     0: (0, 255, 0),    # LANE_FOLLOW  — green
-    1: (0, 255, 255),  # OBSTACLE_AVOID — yellow
-    2: (255, 165, 0),  # PARKING — orange
-    3: (0, 0, 255),    # STOP — red
+    1: (255, 255, 0),  # LEFT_TURN    — yellow
+    2: (0, 255, 255),  # RIGHT_TURN   — cyan
+    3: (255, 165, 0),  # GO_STRAIGHT  — orange
+    4: (255, 0, 255),  # PULL_OVER    — magenta
+    5: (0, 128, 255),  # PARKING      — light blue
 }
-_SCENARIO_NAMES = {
-    SCENARIO_LANE_FOLLOW:    "LANE_FOLLOW",
-    SCENARIO_OBSTACLE_AVOID: "OBSTACLE_AVOID",
-    SCENARIO_PARKING:        "PARKING",
-    SCENARIO_STOP:           "STOP",
-}
+_SCENARIO_NAMES = SCENARIO_NAMES  # imported from planner_model
 _BOX_COLORS = [
     (0, 255, 0), (255, 0, 0), (0, 165, 255), (255, 165, 0),
     (128, 0, 128), (0, 255, 255), (255, 255, 0), (0, 128, 255),
@@ -401,6 +403,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
 
             # ── Save row (rate-limited, only when recording is toggled ON) ─────
             is_recording = web_viewer.recording if web_viewer else True
+            cur_scenario = web_viewer.scenario  if web_viewer else scenario
             now = time.monotonic()
             if is_recording and now - last_save_time >= save_interval:
                 last_save_time = now
@@ -410,7 +413,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                     obj_feats  = obj_feats,
                     lane_feats = lane_feats,
                     ego_feats  = ego_feats,
-                    scenario   = scenario,
+                    scenario   = cur_scenario,
                     steering   = input_steering,
                     throttle   = input_throttle,
                 )
@@ -444,13 +447,13 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
             if web_viewer is not None:
                 annotated = _annotate(
                     color_bgr, boxes, distances, class_ids,
-                    scenario, input_steering, input_throttle, fps,
+                    cur_scenario, input_steering, input_throttle, fps,
                     left_lane_x, right_lane_x, saved_count,
                     mask=mask, lane_feats=lane_feats,
                 )
                 web_viewer.broadcast_frame(annotated)
                 web_viewer.broadcast_status({
-                    'scenario':      sc_name,
+                    'scenario':      _SCENARIO_NAMES.get(cur_scenario, str(cur_scenario)),
                     'steering':      input_steering,
                     'throttle':      input_throttle,
                     'fps':           fps,
@@ -488,7 +491,8 @@ if __name__ == "__main__":
     parser.add_argument('--web-port', type=int, default=8082,
                         help='Web viewer HTTP port (default 8082, 0 to disable)')
     parser.add_argument('--scenario', type=int, default=SCENARIO_LANE_FOLLOW,
-                        choices=[0, 1, 2, 3],
-                        help='Scenario token: 0=LANE_FOLLOW 1=OBSTACLE_AVOID 2=PARKING 3=STOP')
+                        choices=[0, 1, 2, 3, 4, 5],
+                        help='Starting scenario token (can be changed live via 0-5 keys in viewer): '
+                             '0=LANE_FOLLOW 1=LEFT_TURN 2=RIGHT_TURN 3=GO_STRAIGHT 4=PULL_OVER 5=PARKING')
     args = parser.parse_args()
     main(web_port=args.web_port, scenario=args.scenario)

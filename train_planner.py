@@ -168,7 +168,7 @@ def train(
     print(f"  Total samples   : {len(df)}")
     print()
     print("  Scenario distribution:")
-    scenario_map = {0: "LANE_FOLLOW", 1: "OBSTACLE_AVOID", 2: "PARKING", 3: "STOP"}
+    from planner_model import SCENARIO_NAMES as scenario_map
     for sc, cnt in df["scenario"].value_counts().sort_index().items():
         print(f"    {scenario_map.get(sc, sc):20s}: {cnt:>6d}  ({100*cnt/len(df):.1f}%)")
     print()

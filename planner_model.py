@@ -39,7 +39,7 @@ GRID_ROWS     = 6     # spatial grid rows (far → near)
 GRID_COLS     = 12    # spatial grid columns (left → right)
 LANE_FEATURES = GRID_ROWS * GRID_COLS   # 72 — spatial grid of lane fractions
 EGO_FEATURES  = 2     # ego state features (prev_steering, prev_throttle)
-N_SCENARIOS   = 4     # scenario vocabulary size
+N_SCENARIOS   = 6     # scenario vocabulary size
 SCENARIO_DIM  = 8     # embedding dimension for scenario token
 
 OBJECT_BLOCK_DIM = N_MAX_OBJECTS * OBJ_FEATURES   # 40
@@ -50,10 +50,21 @@ FIXED_LEFT_LANE_X  = 255
 FIXED_RIGHT_LANE_X = 485
 
 # Scenario tokens
-SCENARIO_LANE_FOLLOW    = 0
-SCENARIO_OBSTACLE_AVOID = 1
-SCENARIO_PARKING        = 2
-SCENARIO_STOP           = 3
+SCENARIO_LANE_FOLLOW = 0   # normal driving — obstacle avoidance implicit via YOLO features
+SCENARIO_LEFT_TURN   = 1   # turning left at junction
+SCENARIO_RIGHT_TURN  = 2   # turning right at junction
+SCENARIO_GO_STRAIGHT = 3   # straight through intersection / past stop line
+SCENARIO_PULL_OVER   = 4   # pulling over to roadside (emergency stop)
+SCENARIO_PARKING     = 5   # parking manoeuvre
+
+SCENARIO_NAMES = {
+    SCENARIO_LANE_FOLLOW: "LANE_FOLLOW",
+    SCENARIO_LEFT_TURN:   "LEFT_TURN",
+    SCENARIO_RIGHT_TURN:  "RIGHT_TURN",
+    SCENARIO_GO_STRAIGHT: "GO_STRAIGHT",
+    SCENARIO_PULL_OVER:   "PULL_OVER",
+    SCENARIO_PARKING:     "PARKING",
+}
 
 # Normalisation constants  (shared between collection and inference)
 MAX_DIST_M     = 5.0    # clip distances beyond this to 1.0

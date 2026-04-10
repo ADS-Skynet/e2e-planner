@@ -97,6 +97,12 @@ _HTML = """<!DOCTYPE html>
                border-radius:3px; position:relative; margin:4px auto; }
   .steer-indicator { position:absolute; top:2px; width:6px; height:10px;
                      background:#4af; border-radius:2px; transform:translateX(-50%); }
+  #scenario-bar { display:flex; flex-wrap:wrap; gap:4px; margin:6px 0 2px;
+                  align-items:center; }
+  #scenario-bar .label { color:#888; font-size:0.8rem; margin-right:4px; }
+  .sc-btn { font-size:0.78rem; padding:3px 8px; border-radius:4px; border:1px solid #555;
+            background:#222; color:#aaa; cursor:pointer; }
+  .sc-btn.active { background:#246; color:#8cf; border-color:#48a; font-weight:bold; }
 </style>
 </head>
 <body>
@@ -116,7 +122,16 @@ _HTML = """<!DOCTYPE html>
 <div class="steer-bar">
   <div class="steer-indicator" id="steer-indicator" style="left:50%"></div>
 </div>
-<div id="ctrl">← / → steer (tap=0.3 · hold 300ms=0.6 · hold 600ms=0.9) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause</div>
+<div id="scenario-bar">
+  <span class="label">Scenario:</span>
+  <button id="sc-0" class="sc-btn active" onclick="setScenario(0)">0 Lane Follow</button>
+  <button id="sc-1" class="sc-btn"        onclick="setScenario(1)">1 Left Turn</button>
+  <button id="sc-2" class="sc-btn"        onclick="setScenario(2)">2 Right Turn</button>
+  <button id="sc-3" class="sc-btn"        onclick="setScenario(3)">3 Go Straight</button>
+  <button id="sc-4" class="sc-btn"        onclick="setScenario(4)">4 Pull Over</button>
+  <button id="sc-5" class="sc-btn"        onclick="setScenario(5)">5 Parking</button>
+</div>
+<div id="ctrl">← / → steer (tap=0.3 · hold 300ms=0.6 · hold 600ms=0.9) &nbsp;|&nbsp; ↑ throttle +0.1 &nbsp; ↓ throttle = 0 &nbsp;|&nbsp; Space = record &nbsp;|&nbsp; P = pause &nbsp;|&nbsp; 0-5 = scenario</div>
 
 <script>
 const canvas = document.getElementById('feed');
@@ -226,6 +241,15 @@ function togglePause() {
   }
 }
 
+function setScenario(n) {
+  document.querySelectorAll('.sc-btn').forEach((b, i) => {
+    b.classList.toggle('active', i === n);
+  });
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type: 'scenario_change', value: n}));
+  }
+}
+
 function _stopSteerRamp() {
   if (steerTimer !== null) { clearInterval(steerTimer); steerTimer = null; }
   steerDir   = 0;
@@ -261,6 +285,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowDown')  { throttle = 0.0; changed = true; }
   else if (e.key === ' ')          { sendRecording(); e.preventDefault(); return; }
   else if (e.key === 'p' || e.key === 'P') { togglePause(); e.preventDefault(); return; }
+  else if (e.key >= '0' && e.key <= '5')  { setScenario(parseInt(e.key)); e.preventDefault(); return; }
   if (changed) { e.preventDefault(); sendControl(); }
 });
 
@@ -322,6 +347,7 @@ class PlannerViewer:
         self._throttle  = 0.0   # 0–1; ↑ adds 0.1 per press, ↓ resets to 0
         self._recording = False  # toggled by Space
         self._paused    = False  # toggled by P / pause button
+        self._scenario  = 0     # current scenario token (0–5)
 
         self._clients:  Set = set()
         self._loop:     Optional[asyncio.AbstractEventLoop] = None
@@ -357,6 +383,13 @@ class PlannerViewer:
         """True when P / pause button is active — motor output should be suppressed."""
         with self._lock:
             return self._paused
+
+    @property
+    def scenario(self) -> int:
+        """Current scenario token (0–5), settable from the web UI."""
+        with self._lock:
+            return self._scenario
+
 
     # ── Broadcast ─────────────────────────────────────────────────────────────
 
@@ -581,6 +614,13 @@ class PlannerViewer:
                             self._paused = not self._paused
                         state = 'PAUSED' if self._paused else 'RUNNING'
                         print(f"[PlannerViewer] {state}")
+                    elif msg.get('type') == 'scenario_change':
+                        sc = int(msg.get('value', 0))
+                        if 0 <= sc <= 5:
+                            with self._lock:
+                                self._scenario = sc
+                            from planner_model import SCENARIO_NAMES
+                            print(f"[PlannerViewer] Scenario → {sc} ({SCENARIO_NAMES.get(sc, sc)})")
                 except (json.JSONDecodeError, ValueError):
                     pass
         except Exception:

@@ -94,7 +94,9 @@ from planner_model import (
     draw_lane_grid_overlay,
     MAX_THROTTLE,
     FRAME_W, FRAME_H,
-    SCENARIO_LANE_FOLLOW, SCENARIO_OBSTACLE_AVOID, SCENARIO_PARKING, SCENARIO_STOP,
+    SCENARIO_LANE_FOLLOW, SCENARIO_LEFT_TURN, SCENARIO_RIGHT_TURN,
+    SCENARIO_GO_STRAIGHT, SCENARIO_PULL_OVER, SCENARIO_PARKING,
+    SCENARIO_NAMES,
 )
 
 PLANNER_MODEL_PATH = script_dir / "planner_model.pth"
@@ -103,12 +105,7 @@ PLANNER_MODEL_PATH = script_dir / "planner_model.pth"
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SCENARIO_NAMES = {
-    SCENARIO_LANE_FOLLOW:    "LANE_FOLLOW",
-    SCENARIO_OBSTACLE_AVOID: "OBSTACLE_AVOID",
-    SCENARIO_PARKING:        "PARKING",
-    SCENARIO_STOP:           "STOP",
-}
+_SCENARIO_NAMES = SCENARIO_NAMES  # imported from planner_model
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature extraction
@@ -150,10 +147,12 @@ import cv2
 _visualizer = LKASVisualizer(image_width=FRAME_W, image_height=FRAME_H)
 
 _MODE_COLORS = {
-    SCENARIO_LANE_FOLLOW:    (0, 255, 0),
-    SCENARIO_OBSTACLE_AVOID: (0, 255, 255),
-    SCENARIO_PARKING:        (255, 165, 0),
-    SCENARIO_STOP:           (0, 0, 255),
+    SCENARIO_LANE_FOLLOW: (0, 255, 0),
+    SCENARIO_LEFT_TURN:   (255, 255, 0),
+    SCENARIO_RIGHT_TURN:  (0, 255, 255),
+    SCENARIO_GO_STRAIGHT: (255, 165, 0),
+    SCENARIO_PULL_OVER:   (255, 0, 255),
+    SCENARIO_PARKING:     (0, 128, 255),
 }
 _BOX_COLORS = [
     (0, 255, 0), (255, 0, 0), (0, 165, 255), (255, 165, 0),
@@ -455,7 +454,7 @@ def main(
                 control_msg = ControlMessage(
                     steering = act_steering,
                     throttle = act_throttle,
-                    brake    = 1.0 if (is_paused or scenario == SCENARIO_STOP) else 0.0,
+                    brake    = 1.0 if is_paused else 0.0,
                 )
                 control_channel.write(control_msg, frame_id=frame_id,
                                       timestamp=time.time(), processing_time_ms=0.0)
@@ -529,8 +528,8 @@ if __name__ == "__main__":
     parser.add_argument('--motor',    action='store_true',
                         help='Enable JetRacer motor output (default: simulation)')
     parser.add_argument('--scenario', type=int,  default=SCENARIO_LANE_FOLLOW,
-                        choices=[0, 1, 2, 3],
-                        help='0=LANE_FOLLOW 1=OBSTACLE_AVOID 2=PARKING 3=STOP')
+                        choices=[0, 1, 2, 3, 4, 5],
+                        help='0=LANE_FOLLOW 1=LEFT_TURN 2=RIGHT_TURN 3=GO_STRAIGHT 4=PULL_OVER 5=PARKING')
     parser.add_argument('--model',    type=Path, default=PLANNER_MODEL_PATH,
                         help=f'Model .pth file (default: {PLANNER_MODEL_PATH})')
     parser.add_argument('--verbose',     action='store_true',
