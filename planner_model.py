@@ -57,7 +57,7 @@ SCENARIO_STOP           = 3
 
 # Normalisation constants  (shared between collection and inference)
 MAX_DIST_M     = 5.0    # clip distances beyond this to 1.0
-MAX_THROTTLE   = 0.30   # physical max throttle used during collection
+MAX_THROTTLE   = 0.35   # physical max throttle used during collection (matches FULL_THROTTLE in planner_viewer.py)
 FRAME_W        = 848    # must match camera config — RealSense supported: 848x480, 640x480, 640x360
 FRAME_H        = 480
 N_YOLO_CLASSES = 80     # COCO classes; override if using custom model
@@ -332,7 +332,7 @@ class PlannerModel(nn.Module):
         )
         self.throttle_head = nn.Sequential(
             nn.Linear(64, 1),
-            nn.Sigmoid(),             # throttle  ∈ [0, 1]  (multiply by MAX_THROTTLE)
+            nn.Sigmoid(),             # throttle  ∈ [0, 1]  (scale × MAX_THROTTLE for actuation)
         )
 
     def forward(

@@ -133,7 +133,11 @@ def extract_features(
         frame_w=FRAME_W, frame_h=FRAME_H, n_classes=N_YOLO_CLASSES,
     )
     lane_feats = build_lane_grid(mask)
-    ego_feats  = [prev_steering, prev_throttle / MAX_THROTTLE]
+    # NOTE: training data used MAX_THROTTLE=0.30 for ego normalisation (stored
+    # values are 0.35/0.30 ≈ 1.167).  Use the same divisor here so the model
+    # sees the same input distribution.  Update to MAX_THROTTLE after retrain.
+    _EGO_THR_DIV = 0.30
+    ego_feats  = [prev_steering, prev_throttle / _EGO_THR_DIV]
 
     objects_t = torch.tensor(obj_feats,  dtype=torch.float32, device=device).unsqueeze(0)
     lane_t    = torch.tensor(lane_feats, dtype=torch.float32, device=device).unsqueeze(0)
@@ -248,6 +252,7 @@ def main(
     scenario:     int  = SCENARIO_LANE_FOLLOW,
     model_path:   Path = PLANNER_MODEL_PATH,
     verbose:      bool = False,
+    log_history:  bool = False,
 ):
     # Both YOLO and planner run on CPU.
     # LKAS BiSeNet (DL method, device="auto") claims the GPU; putting YOLO
@@ -265,6 +270,7 @@ def main(
     print(f"  Model     : {model_path}")
     print(f"  Motor     : {'ACTIVE' if enable_motor else 'SIMULATION'}")
     print(f"  Web       : {'port ' + str(web_port) if web_port > 0 else 'DISABLED'}")
+    print(f"  History   : {'ENABLED' if log_history else 'disabled'}")
     print()
 
     # ── Planner model ─────────────────────────────────────────────────────────
@@ -311,7 +317,7 @@ def main(
     car = None
     if enable_motor and JETRACER_AVAILABLE:
         car = NvidiaRacecar()
-        car.steering_offset = 0.05
+        car.steering_offset = 0.035  # adjust if steering is not centred at 0.0
         car.throttle = 0.0
         car.steering = 0.0
         time.sleep(0.2)   # wait for servo to physically centre before starting
@@ -326,9 +332,25 @@ def main(
         web_viewer.start()
         print(f"[WEB] Viewer at http://0.0.0.0:{web_port}")
 
+    # ── Output history logger ─────────────────────────────────────────────────
+    _hist_fh = _hist_writer = None
+    if log_history:
+        import csv as _csv
+        _hist_path = script_dir / f"inference_history_{int(time.time())}.csv"
+        _hist_fh   = open(_hist_path, "w", newline="")
+        _hist_writer = _csv.writer(_hist_fh)
+        _hist_writer.writerow([
+            "frame_id", "timestamp",
+            "raw_steer", "raw_thr",          # raw sigmoid/tanh outputs
+            "final_steer", "final_thr",       # after clamp
+            "act_steer", "act_thr",           # actually sent to motor
+            "lane_detected", "n_objects", "scenario",
+        ])
+        print(f"[HIST] Logging to {_hist_path}")
+
     # ── State ─────────────────────────────────────────────────────────────────
-    prev_steering    = 0.0
-    prev_throttle    = 0.0
+    prev_steering = 0.0
+    prev_throttle = MAX_THROTTLE   # warm-start: ego sees ≈1.167 (matches training distribution)
 
     fps       = 0.0
     fps_count = 0
@@ -385,10 +407,10 @@ def main(
 
             # Denormalise outputs
             final_steering = float(out[0, 0].item())               # tanh → [-1, 1]
-            final_throttle = float(out[0, 1].item()) * MAX_THROTTLE # sigmoid × MAX_THROTTLE
+            final_throttle = float(out[0, 1].item()) * MAX_THROTTLE # sigmoid [0,1] → [0, MAX_THROTTLE]
 
             # Clamp for safety
-            final_steering = float(np.clip(final_steering, -1.0,  1.0))
+            final_steering = float(np.clip(final_steering, -1.0,       1.0))
             final_throttle = float(np.clip(final_throttle,  0.0, MAX_THROTTLE))
 
             # ── Verbose debug ──────────────────────────────────────────────────
@@ -420,6 +442,16 @@ def main(
             if car is not None:
                 car.steering = -act_steering   # hardware inversion
                 car.throttle = -act_throttle   # negative = forward
+
+            # ── History log ───────────────────────────────────────────────────
+            if _hist_writer is not None:
+                _hist_writer.writerow([
+                    frame_id, f"{time.time():.4f}",
+                    f"{out[0,0].item():+.5f}", f"{out[0,1].item():.5f}",
+                    f"{final_steering:+.5f}",  f"{final_throttle:.5f}",
+                    f"{act_steering:+.5f}",    f"{act_throttle:.5f}",
+                    int(lane_detected), len(boxes), scenario,
+                ])
 
             # ── Write to control SHM (optional) ───────────────────────────────
             nearest = min((d for d in distances if d > 0), default=-1.0)
@@ -478,6 +510,10 @@ def main(
             car.throttle = 0.0
             car.steering = 0.0
             time.sleep(0.3)   # hold neutral long enough for servo to physically reach centre
+        if _hist_fh is not None:
+            _hist_fh.flush()
+            _hist_fh.close()
+            print(f"[HIST] Saved → {_hist_path}")
         try: camera.close()
         except Exception: pass
         if web_viewer is not None:
@@ -501,12 +537,15 @@ if __name__ == "__main__":
                         help='0=LANE_FOLLOW 1=OBSTACLE_AVOID 2=PARKING 3=STOP')
     parser.add_argument('--model',    type=Path, default=PLANNER_MODEL_PATH,
                         help=f'Model .pth file (default: {PLANNER_MODEL_PATH})')
-    parser.add_argument('--verbose',  action='store_true',
+    parser.add_argument('--verbose',     action='store_true',
                         help='Print per-frame debug: object list, lane, model outputs')
+    parser.add_argument('--log-history', action='store_true',
+                        help='Write per-frame steering/throttle output to inference_history_<ts>.csv')
     args = parser.parse_args()
 
     main(web_port     = args.web_port,
          enable_motor = args.motor,
          scenario     = args.scenario,
          model_path   = args.model,
-         verbose      = args.verbose)
+         verbose      = args.verbose,
+         log_history  = args.log_history)

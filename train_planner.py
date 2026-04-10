@@ -42,7 +42,7 @@ from planner_model import (
     row_to_tensors,
     N_MAX_OBJECTS, OBJ_FEATURES, LANE_FEATURES, EGO_FEATURES,
     GRID_ROWS, GRID_COLS,
-    N_SCENARIOS,
+    N_SCENARIOS, MAX_THROTTLE,
 )
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
