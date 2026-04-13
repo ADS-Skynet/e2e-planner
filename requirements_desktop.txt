@@ -15,8 +15,8 @@
 #   pip install -r requirements_desktop.txt
 
 # ── Core training stack ───────────────────────────────────────────────────────
-torch>=2.6.0           # Blackwell sm_120 support; install via cu128 wheel (see above)
-torchvision>=0.21.0    # matches torch 2.6
+# torch>=2.6.0           # Blackwell sm_120 support; install via cu128 wheel (see above)
+# torchvision>=0.21.0    # matches torch 2.6
 
 # ── Data + training utilities ─────────────────────────────────────────────────
 pandas>=2.0.0
