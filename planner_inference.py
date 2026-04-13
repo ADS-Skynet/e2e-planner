@@ -346,7 +346,7 @@ def main(
 
     # ── State ─────────────────────────────────────────────────────────────────
     prev_steering = 0.0
-    prev_throttle = 0.0
+    prev_throttle = MAX_THROTTLE  # warm-start: avoids ego=0 → low-throttle feedback loop
 
     fps       = 0.0
     fps_count = 0

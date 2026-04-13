@@ -81,6 +81,15 @@ class PlannerDataset(Dataset):
         if len(df) < before:
             print(f"[data] Dropped {before - len(df)} rows with NaN values")
 
+        # Drop startup frames where ego_throttle≈0 but target_throttle is also low.
+        # These occur at the beginning of each collection session before the vehicle
+        # gets up to speed. Training on them teaches the model ego=0 → output low
+        # throttle, which creates a stuck feedback loop at inference startup.
+        before = len(df)
+        df = df[~((df["ego_throttle"] < 0.1) & (df["target_throttle"] < 0.1))].reset_index(drop=True)
+        if len(df) < before:
+            print(f"[data] Dropped {before - len(df)} startup rows (ego_thr<0.1 & target_thr<0.1)")
+
         self.df = df
         print(f"[data] Loaded {len(df)} rows from {csv_path.name}")
 
