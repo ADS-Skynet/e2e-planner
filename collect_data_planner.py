@@ -294,6 +294,7 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
     web_viewer = None
     if web_port > 0:
         web_viewer = PlannerViewer(http_port=web_port, ws_port=web_port + 1)
+        web_viewer._scenario = scenario   # seed from --scenario CLI flag
         web_viewer.start()
         print(f"[WEB] Viewer: http://0.0.0.0:{web_port}")
 

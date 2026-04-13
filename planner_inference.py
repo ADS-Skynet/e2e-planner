@@ -324,6 +324,7 @@ def main(
     web_viewer = None
     if web_port > 0:
         web_viewer = PlannerViewer(http_port=web_port, ws_port=web_port + 1)
+        web_viewer._scenario = scenario   # seed from --scenario CLI flag
         web_viewer.start()
         print(f"[WEB] Viewer at http://0.0.0.0:{web_port}")
 
@@ -351,10 +352,13 @@ def main(
     fps_count = 0
     fps_start = time.time()
 
-    scenario_t = torch.tensor([scenario], dtype=torch.long, device=planner_device)
+    scenario_t   = torch.tensor([scenario], dtype=torch.long, device=planner_device)
+    cur_scenario = scenario
+    sc_name      = _SCENARIO_NAMES.get(scenario, str(scenario))
 
     frame_id = 1
-    print(f"\n[RUN] Running — Ctrl+C to stop\n")
+    print(f"\n[RUN] Running — Ctrl+C to stop")
+    print(f"[RUN] Scenario: {cur_scenario} ({sc_name})\n")
 
     try:
         while True:
@@ -388,6 +392,14 @@ def main(
             distances = r['distances']
             class_ids = r['class_ids']
             confs     = r['confs']
+
+            # ── Scenario (live update from viewer) ────────────────────────────
+            new_scenario = web_viewer.scenario if web_viewer is not None else scenario
+            if new_scenario != cur_scenario:
+                cur_scenario = new_scenario
+                sc_name      = _SCENARIO_NAMES.get(cur_scenario, str(cur_scenario))
+                scenario_t   = torch.tensor([cur_scenario], dtype=torch.long, device=planner_device)
+                print(f"\n[SCENARIO] → {cur_scenario} ({sc_name})")
 
             # ── Planner forward pass ───────────────────────────────────────────
             with torch.no_grad():

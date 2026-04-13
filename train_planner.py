@@ -121,11 +121,12 @@ class PlannerDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(
-    csv_path:   Path  = DEFAULT_CSV,
-    epochs:     int   = 100,
-    lr:         float = 3e-4,
-    batch_size: int   = 64,
-    save_path:  Path  = SAVE_PATH,
+    csv_path:    Path         = DEFAULT_CSV,
+    epochs:      int          = 100,
+    lr:          float        = 3e-4,
+    batch_size:  int          = 64,
+    save_path:   Path         = SAVE_PATH,
+    finetune_from: Path | None = None,
 ) -> None:
 
     # ── Device ────────────────────────────────────────────────────────────────
@@ -143,6 +144,7 @@ def train(
     print(f"  LR        : {lr}")
     print(f"  Batch     : {batch_size}")
     print(f"  Save      : {save_path}")
+    print(f"  Finetune  : {finetune_from if finetune_from else 'NO (train from scratch)'}")
     print()
 
     # ── Dataset ───────────────────────────────────────────────────────────────
@@ -203,6 +205,13 @@ def train(
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = PlannerModel().to(device)
+    if finetune_from is not None:
+        if not finetune_from.exists():
+            print(f"[ERROR] Finetune checkpoint not found: {finetune_from}")
+            sys.exit(1)
+        state = torch.load(str(finetune_from), map_location=device, weights_only=False)
+        model.load_state_dict(state)
+        print(f"  Loaded weights  : {finetune_from}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Model params    : {n_params:,}")
     print()
@@ -321,14 +330,18 @@ if __name__ == "__main__":
                         help='Learning rate (default: 3e-4)')
     parser.add_argument('--batch-size', type=int,   default=64,
                         help='Batch size (default: 64)')
-    parser.add_argument('--output',     type=Path,  default=SAVE_PATH,
+    parser.add_argument('--output',       type=Path,  default=SAVE_PATH,
                         help=f'Model output path (default: {SAVE_PATH})')
+    parser.add_argument('--finetune',     type=Path,  default=None,
+                        help='Start from an existing checkpoint instead of random init '
+                             '(e.g. --finetune planner_model.pth). Use a lower LR, e.g. --lr 5e-5')
     args = parser.parse_args()
 
     train(
-        csv_path   = args.csv,
-        epochs     = args.epochs,
-        lr         = args.lr,
-        batch_size = args.batch_size,
-        save_path  = args.output,
+        csv_path      = args.csv,
+        epochs        = args.epochs,
+        lr            = args.lr,
+        batch_size    = args.batch_size,
+        save_path     = args.output,
+        finetune_from = args.finetune,
     )
