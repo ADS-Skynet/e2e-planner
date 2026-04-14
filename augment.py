@@ -221,7 +221,7 @@ def augment(input_csv: Path, output_csv: Path, seed: int = 42,
         print(f"[ERROR] Input CSV not found: {input_csv}")
         return
 
-    df = pd.read_csv(input_csv)
+    df = pd.read_csv(input_csv, on_bad_lines='warn')
     print(f"[AUG] Loaded {len(df)} rows, {len(df.columns)} columns")
 
     # Validate schema
