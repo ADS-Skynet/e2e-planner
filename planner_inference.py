@@ -312,7 +312,7 @@ def main(
     car = None
     if enable_motor and JETRACER_AVAILABLE:
         car = NvidiaRacecar()
-        car.steering_offset = 0.035  # adjust if steering is not centred at 0.0
+        car.steering_offset = 0.040  # adjust if steering is not centred at 0.0
         car.throttle = 0.0
         car.steering = 0.0
         time.sleep(0.2)   # wait for servo to physically centre before starting
