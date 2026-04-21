@@ -87,6 +87,105 @@ Keyboard controls in the browser still work in parallel — use whichever is con
 
 ---
 
+## PyTorch install on JetPack 6.x
+
+**Do not** `pip install torch` from PyPI — those wheels have no CUDA support on Jetson aarch64.
+
+**Step 1 — install from Jetson AI Lab:**
+```bash
+python3 -m pip install torch torchvision --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126
+```
+
+**Step 2 — fix `ImportError: libcudss.so.0`**
+
+torch ≥ 2.8 requires the CUDA Sparse Direct Solver library (`libcudss`), which JetPack 6.x does not install by default:
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install libcudss0-cuda-12
+```
+
+The package installs the `.so` under a non-standard path, so `ldconfig` needs to be told about it:
+
+```bash
+echo "/usr/lib/aarch64-linux-gnu/libcudss/12" | sudo tee /etc/ld.so.conf.d/cudss.conf
+sudo ldconfig
+```
+
+Verify everything works:
+```bash
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# expected: 2.10.0 True
+```
+
+Tested: torch 2.10.0 / torchvision 0.25.0 / JetPack 6.2 / CUDA 12.6
+
+---
+
+## RealSense Camera on JetPack 6.x
+
+The pre-built `pyrealsense2` wheels on PyPI are compiled for x86 and do **not** work on Jetson aarch64. The Intel librealsense SDK must be built from source with the Python wheel flag enabled.
+
+### Build librealsense from source
+
+**Step 1 — install build dependencies:**
+```bash
+sudo apt-get install -y \
+  git cmake build-essential \
+  libusb-1.0-0-dev libssl-dev \
+  libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev \
+  python3-dev
+```
+
+**Step 2 — clone the repo:**
+```bash
+git clone https://github.com/IntelRealSense/librealsense.git
+cd librealsense
+```
+
+**Step 3 — build with Python bindings:**
+```bash
+mkdir build && cd build
+cmake .. \
+  -DBUILD_PYTHON_BINDINGS=ON \
+  -DPYTHON_EXECUTABLE=$(which python3) \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_GRAPHICAL_EXAMPLES=OFF
+make -j$(nproc)
+sudo make install
+sudo ldconfig
+```
+
+The `-DBUILD_PYTHON_BINDINGS=ON` flag compiles `pyrealsense2` as a `.so` and installs it into the system Python path.
+
+**Step 4 — verify:**
+```bash
+python3 -c "import pyrealsense2 as rs; print(rs.__version__)"
+```
+
+### udev rules (required for non-root access)
+
+Without udev rules the camera is only accessible as root:
+```bash
+cd librealsense
+sudo cp config/99-realsense-libusb.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Unplug and replug the camera after applying the rules.
+
+### Verify the camera is detected
+
+```bash
+rs-enumerate-devices
+# Should list your RealSense model, serial number, and supported streams
+```
+
+---
+
 ## CUDA Out of Memory (OOM)
 
 See [WORKFLOW.md](WORKFLOW.md) — Memory management section.
