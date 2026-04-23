@@ -136,7 +136,7 @@ _HTML = """<!DOCTYPE html>
 <script>
 const canvas = document.getElementById('feed');
 const ctx    = canvas.getContext('2d');
-const WS_PORT = """ + str(8083) + """;
+const WS_PORT = __WS_PORT__;
 
 let ws = null;
 let reconnectTimer = null;
@@ -553,11 +553,31 @@ class PlannerViewer:
     # ── HTTP server ───────────────────────────────────────────────────────────
 
     def _run_http(self):
-        # Patch the HTML with the actual WS port before serving
-        global _HTML
-        _HTML = _HTML.replace('WS_PORT = ' + str(8083),
-                              'WS_PORT = ' + str(self._ws_port))
-        self._http_server = ThreadingHTTPServer(('0.0.0.0', self._http_port), _HTTPHandler)
+        # Build a per-instance HTML body with the correct WS port substituted in.
+        # Using a placeholder avoids mutating the module-level template and works
+        # regardless of what port number was chosen.
+        instance_html = _HTML.replace('__WS_PORT__', str(self._ws_port))
+
+        class _BoundHTTPHandler(_HTTPHandler):
+            _html = instance_html
+
+        def do_GET(self_h):
+            if self_h.path == '/favicon.ico':
+                self_h.send_response(204)
+                self_h.send_header('Connection', 'close')
+                self_h.end_headers()
+                return
+            body = self_h._html.encode()
+            self_h.send_response(200)
+            self_h.send_header('Content-Type',   'text/html; charset=utf-8')
+            self_h.send_header('Content-Length', str(len(body)))
+            self_h.send_header('Connection',     'close')
+            self_h.end_headers()
+            self_h.wfile.write(body)
+
+        _BoundHTTPHandler.do_GET = do_GET
+
+        self._http_server = ThreadingHTTPServer(('0.0.0.0', self._http_port), _BoundHTTPHandler)
         print(f"[PlannerViewer-HTTP] Listening on port {self._http_port}")
         self._http_server.serve_forever()
 

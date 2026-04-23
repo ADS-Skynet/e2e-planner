@@ -205,11 +205,11 @@ def _draw(frame, boxes, distances, class_ids, scenario, steering, throttle, fps,
 
 _yolo_lock    = threading.Lock()
 _yolo_cache   = {'boxes': [], 'distances': [], 'class_ids': [], 'confs': []}
-_yolo_running = False   # True while a YOLO inference is in progress
+_yolo_running = False   # guarded by _yolo_lock — always read/write under the lock
 
 
 def _yolo_worker(yolo, frame, depth_array, depth_scale, frame_w, frame_h):
-    global _yolo_running, _yolo_cache
+    global _yolo_cache
     try:
         results = yolo(frame, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD,
                        device='cpu', verbose=False)
@@ -234,7 +234,9 @@ def _yolo_worker(yolo, frame, depth_array, depth_scale, frame_w, frame_h):
     except Exception as e:
         print(f"\n[YOLO] Error: {e}")
     finally:
-        _yolo_running = False
+        with _yolo_lock:
+            global _yolo_running
+            _yolo_running = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,18 +378,16 @@ def main(
             left_x, right_x = lane_boundaries_from_mask(mask)
 
             # ── YOLO (background thread — never blocks the main loop) ─────────
-            global _yolo_running
-            if not _yolo_running:
-                _yolo_running = True
-                threading.Thread(
-                    target=_yolo_worker,
-                    args=(yolo, color_bgr.copy(), depth_array.copy(),
-                          depth_scale, frame_w, frame_h),
-                    daemon=True,
-                ).start()
-
             with _yolo_lock:
-                r         = _yolo_cache
+                if not _yolo_running:
+                    _yolo_running = True
+                    threading.Thread(
+                        target=_yolo_worker,
+                        args=(yolo, color_bgr.copy(), depth_array.copy(),
+                              depth_scale, frame_w, frame_h),
+                        daemon=True,
+                    ).start()
+                r = _yolo_cache
             boxes     = r['boxes']
             distances = r['distances']
             class_ids = r['class_ids']

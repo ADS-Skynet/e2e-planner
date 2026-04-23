@@ -93,6 +93,19 @@ class PlannerDataset(Dataset):
         self.df = df
         print(f"[data] Loaded {len(df)} rows from {csv_path.name}")
 
+        # Warn if any scenario has effectively no lane features — indicates BiSeNet
+        # wasn't detecting lanes during that collection session.  The model will
+        # never generalise to lane=YES for that scenario.
+        from planner_model import SCENARIO_NAMES, GRID_ROWS, GRID_COLS
+        lane_cols = [f"lane_r{r}c{c}" for r in range(GRID_ROWS) for c in range(GRID_COLS)]
+        for sc, grp in df.groupby("scenario"):
+            lane_mean = grp[lane_cols].values.mean()
+            if lane_mean < 0.01:
+                sc_name = SCENARIO_NAMES.get(sc, str(sc))
+                print(f"[WARN] Scenario {sc} ({sc_name}): lane features are all ~0 "
+                      f"(mean={lane_mean:.4f}). Looks like BiSeNet had no detections "
+                      f"during this collection session. Re-collect with lanes visible.")
+
     def __len__(self) -> int:
         return len(self.df)
 
@@ -180,8 +193,14 @@ def train(
     print()
     print("  Scenario distribution:")
     from planner_model import SCENARIO_NAMES as scenario_map
-    for sc, cnt in df["scenario"].value_counts().sort_index().items():
+    sc_counts = df["scenario"].value_counts().sort_index()
+    for sc, cnt in sc_counts.items():
         print(f"    {scenario_map.get(sc, sc):20s}: {cnt:>6d}  ({100*cnt/len(df):.1f}%)")
+    if len(sc_counts) > 1:
+        imbalance = sc_counts.max() / sc_counts.min()
+        if imbalance > 5:
+            print(f"  [WARN] Scenario imbalance {imbalance:.0f}× — dominant scenario will overpower others.")
+            print(f"         Collect more data for under-represented scenarios before training.")
     print()
     print("  Target steering:")
     print(f"    mean={df['target_steering'].mean():+.4f}  "

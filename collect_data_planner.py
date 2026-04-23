@@ -120,11 +120,11 @@ PLANNER_CSV   = DATA_DIR / "planner_data.csv"
 
 _yolo_lock    = threading.Lock()
 _yolo_cache   = {'boxes': [], 'distances': [], 'class_ids': [], 'confs': []}
-_yolo_running = False
+_yolo_running = False  # guarded by _yolo_lock — always read/write under the lock
 
 
 def _yolo_worker(yolo, frame, depth_array, depth_scale, frame_w, frame_h):
-    global _yolo_running, _yolo_cache
+    global _yolo_cache
     try:
         results = yolo(frame, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD,
                        device=YOLO_DEVICE, verbose=False)
@@ -149,7 +149,9 @@ def _yolo_worker(yolo, frame, depth_array, depth_scale, frame_w, frame_h):
     except Exception as e:
         print(f"\n[YOLO] Error: {e}")
     finally:
-        _yolo_running = False
+        with _yolo_lock:
+            global _yolo_running
+            _yolo_running = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,6 +345,9 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
     fps            = 0.0
     fps_count      = 0
     fps_start      = time.time()
+    # Track consecutive no-lane frames while recording — warn if BiSeNet isn't detecting
+    _no_lane_rec_streak = 0
+    _NO_LANE_WARN_THRESH = 30   # warn after ~3 s at 10 fps
 
     print(f"\n[COLLECT] Running — Ctrl+C to stop\n")
 
@@ -361,17 +366,15 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                           np.zeros((FRAME_H, FRAME_W), dtype=np.uint16)
 
             # ── YOLO (background thread — never blocks the main loop) ─────────
-            global _yolo_running
-            if not _yolo_running:
-                _yolo_running = True
-                threading.Thread(
-                    target=_yolo_worker,
-                    args=(yolo, color_bgr.copy(), depth_array.copy(),
-                          depth_scale, FRAME_W, FRAME_H),
-                    daemon=True,
-                ).start()
-
             with _yolo_lock:
+                if not _yolo_running:
+                    _yolo_running = True
+                    threading.Thread(
+                        target=_yolo_worker,
+                        args=(yolo, color_bgr.copy(), depth_array.copy(),
+                              depth_scale, FRAME_W, FRAME_H),
+                        daemon=True,
+                    ).start()
                 r = _yolo_cache
             boxes     = r['boxes']
             distances = r['distances']
@@ -420,6 +423,20 @@ def main(web_port: int = 8082, scenario: int = SCENARIO_LANE_FOLLOW):
                 )
                 frame_id    += 1
                 saved_count += 1
+
+                # Track no-lane streak and warn — rows with lane=NO teach the model
+                # nothing about lane-following and will cause pegged steering at inference.
+                if not lane_detected:
+                    _no_lane_rec_streak += 1
+                    if _no_lane_rec_streak == _NO_LANE_WARN_THRESH:
+                        sys.stdout.write(
+                            f"\n[WARN] Lane not detected for {_no_lane_rec_streak} consecutive"
+                            f" saved rows. Saving lane=NO data. Check camera angle / lighting"
+                            f" or pause recording until lanes are visible.\n"
+                        )
+                        sys.stdout.flush()
+                else:
+                    _no_lane_rec_streak = 0
 
                 steer_tag = " ←" if input_steering < 0 else " →" if input_steering > 0 else "  ↑"
                 sys.stdout.write(
